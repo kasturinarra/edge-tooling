@@ -82,9 +82,10 @@ Compute once at the start by running `date +%y%m%d` and substituting into the pa
       Use the Write tool to save the file. The file must contain the complete analysis report."
    ```
 
-3. Launch **ALL** agents in a **single message** as **foreground** agents (do NOT use `run_in_background`). Foreground agents in the same message run concurrently — this is just as fast as background agents but keeps your turn active until all complete.
-4. Say "Analyzing N jobs in parallel..." in your message text alongside the Agent tool calls.
-5. When all agents return, immediately proceed to Step 3 in the same turn. Do NOT stop or end your turn between Step 2 and Step 3.
+3. If the prepare output contains a `"zstream"` key, process those entries the same way — they use patch versions (e.g., `4.19.3`) as the `<RELEASE>` value but follow the identical naming and analysis pattern.
+4. Launch **ALL** agents in a **single message** as **foreground** agents (do NOT use `run_in_background`). Foreground agents in the same message run concurrently — this is just as fast as background agents but keeps your turn active until all complete.
+5. Say "Analyzing N jobs in parallel..." in your message text alongside the Agent tool calls.
+6. When all agents return, immediately proceed to Step 3 in the same turn. Do NOT stop or end your turn between Step 2 and Step 3.
 
 ### Step 3: Finalize — Aggregate and Generate HTML Report
 
@@ -142,6 +143,24 @@ HTML report generated: <WORKDIR>/report-lvm-operator-ci-doctor.html
 - `gsutil` CLI must be installed for GCS access (uses anonymous access on public buckets)
 - Internet access to fetch job data from Prow/GCS
 - Bash shell, Python 3
+
+### Z-Stream Integration (Optional)
+
+If a `zstream-summary.json` file exists in the workdir, the HTML report will include a **Z-Stream** checkbox on the Periodics tab. When checked, it switches the view to show z-stream release status per version (PR info, image digest, triggered jobs).
+
+To populate z-stream data before generating the report:
+
+```text
+bash plugins/lvms-ci/scripts/zstream-trigger.sh --dry-run --workdir <WORKDIR>
+```
+
+This queries GitHub for open z-stream release PRs on `openshift/lvm-operator`, resolves catalog image digests via quay.io, and writes `zstream-summary.json` to the workdir — without triggering any jobs (dry-run mode).
+
+To actually trigger z-stream e2e jobs (requires `MY_APPCI_TOKEN`):
+
+```text
+bash plugins/lvms-ci/scripts/zstream-trigger.sh --workdir <WORKDIR>
+```
 
 ## Related Skills
 
