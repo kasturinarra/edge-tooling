@@ -9,7 +9,6 @@ plugins/microshift-ci/scripts/run-doctor.py -> component "microshift").
 """
 
 import argparse
-import copy
 import json
 import logging
 import os
@@ -146,10 +145,6 @@ def parse_args():
                         help="Include pull request analysis")
     parser.add_argument("--repo",
                         help="GitHub org/repo for source checkout (e.g. openshift/microshift)")
-    parser.add_argument("--predecessor-workdir",
-                        default=os.environ.get("CI_DOCTOR_PREDECESSOR_WORKDIR"),
-                        help="Path to a predecessor run's workdir for RCA reuse "
-                             "(also reads CI_DOCTOR_PREDECESSOR_WORKDIR env var)")
     return parser.parse_args()
 
 
@@ -198,7 +193,6 @@ class DoctorPipeline:
 
         self.prepare_summary = None
         self.analyze_costs = {}
-        self.predecessor_workdir = args.predecessor_workdir
 
     @property
     def agent_system_prompt(self):
@@ -480,9 +474,6 @@ class DoctorPipeline:
 
         log.info("Analyzing %d jobs (max %d parallel)...", len(jobs), self.max_parallel)
 
-        # Load validation before worker threads can reuse predecessor results.
-        _load_validate_module()
-
         results = {}
         with ThreadPoolExecutor(max_workers=self.max_parallel) as pool:
             futures = {}
@@ -495,7 +486,6 @@ class DoctorPipeline:
                     agent_system_prompt=self.agent_system_prompt,
                     logs_dir=str(self.logs_dir),
                     workdir=str(self.workdir),
-                    predecessor_workdir=self.predecessor_workdir,
                 )
                 futures[future] = job_info
 
@@ -559,8 +549,7 @@ class DoctorPipeline:
                     continue
                 build_id = job.get("build_id", f"unknown-{i}")
                 log_name = f"prow-job-analyzer-{release}-{build_id}.log"
-                output_name = _analysis_output_name(
-                    job.get("job", ""), build_id, release=release)
+                output_name = f"release-{release}-job-{i}-{build_id}.json"
                 jobs.append({
                     "label": f"{release}/{build_id}",
                     "release": release,
@@ -593,8 +582,7 @@ class DoctorPipeline:
                 pr_number = job.get("pr_number", "unknown")
                 job_name = job.get("job", "")
                 log_name = f"prow-job-analyzer-pr{pr_number}-{build_id}.log"
-                output_name = _analysis_output_name(
-                    job_name, build_id, pr_number=pr_number)
+                output_name = f"prs-job-{i}-pr{pr_number}-{build_id}.json"
                 jobs.append({
                     "label": f"pr{pr_number}/{build_id}",
                     "release": "prs",
@@ -968,135 +956,8 @@ def _run_claude_session(prompt, system_prompt, plugin_dir, model, log_path,
         return False, None
 
 
-def _safe_filename_component(value):
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value)).strip(".-")
-    return safe or "unknown"
-
-
-def _analysis_output_name(job_name, build_id, *, release=None, pr_number=None):
-    job_part = _safe_filename_component(job_name)
-    build_part = _safe_filename_component(build_id)
-    if release is not None:
-        return f"release-{_safe_filename_component(release)}-job-{job_part}-{build_part}.json"
-    return f"prs-job-pr{_safe_filename_component(pr_number)}-{job_part}-{build_part}.json"
-
-
-def _empty_job_stats():
-    return {
-        "cost_usd": 0, "duration_ms": 0, "stop_hook_count": 0,
-        "num_turns": 0, "subagent_turns": 0, "permission_denials": 0,
-        "first_hook_at_turn": 0, "context_exhausted": False,
-    }
-
-
-def rebase_evidence_paths(rca_output, old_workdir, new_workdir):
-    """Rebase citations within the predecessor workdir, rejecting unsafe paths."""
-    old_root = Path(old_workdir).resolve()
-    new_root = Path(new_workdir).resolve()
-    unsafe_evidence = []
-    rebased = copy.deepcopy(rca_output)
-
-    if not isinstance(rebased, list):
-        return rebased, unsafe_evidence
-
-    for entry in rebased:
-        if not isinstance(entry, dict):
-            continue
-        chain = entry.get("causal_chain")
-        if not isinstance(chain, list):
-            continue
-        for link in chain:
-            if not isinstance(link, dict):
-                continue
-            evidence = link.get("evidence", "")
-            if not isinstance(evidence, str):
-                continue
-            match = re.fullmatch(r"(.+):(\d+)", evidence)
-            if not match:
-                continue
-            path_part, line_no = match.groups()
-            evidence_path = Path(path_part)
-            if not evidence_path.is_absolute() or ".." in evidence_path.parts:
-                unsafe_evidence.append(evidence)
-                continue
-            try:
-                relative_path = evidence_path.resolve(strict=True).relative_to(old_root)
-            except (OSError, ValueError):
-                unsafe_evidence.append(evidence)
-                continue
-            new_path = new_root / relative_path
-            try:
-                new_path.resolve(strict=True).relative_to(new_root)
-            except (OSError, ValueError):
-                unsafe_evidence.append(evidence)
-                continue
-            link["evidence"] = f"{new_path}:{line_no}"
-
-    return rebased, unsafe_evidence
-
-
-def _reuse_predecessor_analysis(output_path, predecessor_workdir, workdir):
-    """Copy a valid direct predecessor RCA file or report a reuse miss."""
-    if not predecessor_workdir:
-        return None, False
-
-    predecessor_root = Path(predecessor_workdir).resolve()
-    if not predecessor_root.is_dir():
-        log.info("[REUSE MISS] Predecessor workdir does not exist: %s; running fresh analysis",
-                 predecessor_root)
-        return None, False
-
-    predecessor_jobs = (predecessor_root / "jobs").resolve()
-    predecessor_output = (predecessor_jobs / output_path.name).resolve()
-    try:
-        predecessor_jobs.relative_to(predecessor_root)
-        predecessor_output.relative_to(predecessor_jobs)
-    except ValueError:
-        log.warning("[REUSE MISS] Unsafe predecessor analysis path for %s; running fresh analysis",
-                    output_path.name)
-        return None, False
-
-    if not predecessor_output.is_file():
-        log.info("[REUSE MISS] No predecessor analysis at %s; running fresh analysis",
-                 predecessor_output)
-        return None, False
-
-    try:
-        data = json.loads(predecessor_output.read_text())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        log.warning("[REUSE MISS] Could not load predecessor analysis %s: %s; "
-                    "running fresh analysis", predecessor_output, exc)
-        return None, False
-
-    rebased, unsafe_evidence = rebase_evidence_paths(data, predecessor_root, workdir)
-    if not isinstance(rebased, list):
-        log.warning("[REUSE MISS] Predecessor analysis %s is %s, not an RCA JSON array; "
-                    "running fresh analysis", predecessor_output, type(rebased).__name__)
-        return None, False
-    if unsafe_evidence:
-        log.warning("[REUSE MISS] Predecessor analysis %s has unsafe evidence paths; "
-                    "running fresh analysis", predecessor_output)
-        return None, False
-
-    validation_errors = _run_validation(json.dumps(rebased))
-    if validation_errors:
-        log.info("[REUSE MISS] Predecessor analysis %s failed validation; "
-                 "running fresh analysis", predecessor_output)
-        return None, False
-
-    try:
-        with open(output_path, "w") as f:
-            json.dump(rebased, f, indent=2)
-    except OSError as exc:
-        log.warning("[REUSE MISS] Failed to write reused output: %s", exc)
-        return None, False
-
-    log.info("[REUSE] Reusing predecessor analysis %s", predecessor_output)
-    return rebased, True
-
-
 def _analyze_single_job(job_info, plugin_dir, model, agent_system_prompt,
-                        logs_dir, workdir, predecessor_workdir=None):
+                        logs_dir, workdir):
     """Analyze a single prow job via claude -p. Called in a subprocess."""
     prompt_parts = [
         "Analyze this prow job:",
@@ -1114,10 +975,6 @@ def _analyze_single_job(job_info, plugin_dir, model, agent_system_prompt,
     log_stem = Path(job_info["log_name"]).stem
     debug_file = str(Path(logs_dir) / f"{log_stem}-debug.log")
     output_path = Path(workdir) / "jobs" / job_info["output_name"]
-    _, reused = _reuse_predecessor_analysis(
-        output_path, predecessor_workdir, workdir)
-    if reused:
-        return True, str(output_path), [], _empty_job_stats()
     limits = STAGE_LIMITS["analyze"]
 
     env = os.environ.copy()
