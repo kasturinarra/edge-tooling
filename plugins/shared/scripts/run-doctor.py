@@ -1122,14 +1122,14 @@ def _empty_job_stats():
 
 
 def rebase_evidence_paths(rca_output, old_workdir, new_workdir):
-    """Rewrite safe absolute causal-chain evidence paths for the new workdir."""
+    """Rebase evidence inside *old_workdir*, reporting unsafe citations."""
     old_root = Path(old_workdir).resolve()
     new_root = Path(new_workdir).resolve()
-    warnings = []
+    unsafe_evidence = []
     rebased = copy.deepcopy(rca_output)
 
     if not isinstance(rebased, list):
-        return rebased, warnings
+        return rebased, unsafe_evidence
 
     for entry in rebased:
         if not isinstance(entry, dict):
@@ -1150,22 +1150,23 @@ def rebase_evidence_paths(rca_output, old_workdir, new_workdir):
             path_part, line_no = match.groups()
             evidence_path = Path(path_part)
             if not evidence_path.is_absolute() or ".." in evidence_path.parts:
+                unsafe_evidence.append(evidence)
                 continue
             try:
-                relative_path = evidence_path.resolve().relative_to(old_root)
-            except ValueError:
+                relative_path = evidence_path.resolve(strict=True).relative_to(old_root)
+            except (OSError, ValueError):
+                unsafe_evidence.append(evidence)
                 continue
 
             new_path = new_root / relative_path
+            try:
+                new_path.resolve(strict=True).relative_to(new_root)
+            except (OSError, ValueError):
+                unsafe_evidence.append(evidence)
+                continue
             link["evidence"] = f"{new_path}:{line_no}"
-            if not new_path.is_file():
-                warning = (
-                    f"Rebased evidence file missing: {new_path} (original: {path_part})"
-                )
-                warnings.append(warning)
-                log.warning(warning)
 
-    return rebased, warnings
+    return rebased, unsafe_evidence
 
 
 def _reuse_predecessor_analysis(output_path, predecessor_workdir, workdir):
@@ -1211,7 +1212,7 @@ def _reuse_predecessor_analysis(output_path, predecessor_workdir, workdir):
         )
         return None, False
 
-    rebased, warnings = rebase_evidence_paths(
+    rebased, unsafe_evidence = rebase_evidence_paths(
         predecessor_output_data, predecessor_root, workdir
     )
     if not isinstance(rebased, list):
@@ -1223,6 +1224,14 @@ def _reuse_predecessor_analysis(output_path, predecessor_workdir, workdir):
         )
         return None, False
 
+    if unsafe_evidence:
+        log.warning(
+            "[REUSE MISS] Predecessor analysis %s has unsafe evidence paths; "
+            "running fresh analysis",
+            predecessor_output,
+        )
+        return None, False
+
     validation_errors = _run_validation(json.dumps(rebased))
     if validation_errors:
         log.info(
@@ -1231,15 +1240,6 @@ def _reuse_predecessor_analysis(output_path, predecessor_workdir, workdir):
             predecessor_output,
         )
         return None, False
-
-    if warnings:
-        for rca_entry in rebased:
-            if not isinstance(rca_entry, dict):
-                continue
-            gaps = rca_entry.get("analysis_gaps", [])
-            if isinstance(gaps, list):
-                gaps.extend(warnings)
-                rca_entry["analysis_gaps"] = gaps
 
     try:
         with open(output_path, "w") as output_file:

@@ -388,6 +388,30 @@ class PredecessorReuseTests(unittest.TestCase):
             ),
             "prs-job-pr42-pull-ci-example-67890.json",
         )
+        self.assertNotEqual(
+            RUN_DOCTOR._analysis_output_name(
+                "periodic-ci-example", "12345", release="4.20"
+            ),
+            RUN_DOCTOR._analysis_output_name(
+                "periodic-ci-example", "12345", pr_number="42"
+            ),
+        )
+
+    def test_predecessor_workdir_accepts_cli_and_environment(self):
+        base_args = ["run-doctor.py", "--releases", "main", "--workdir", "/tmp/current"]
+        with mock.patch.dict(
+            os.environ, {"CI_DOCTOR_PREDECESSOR_WORKDIR": "/tmp/environment"}
+        ):
+            with mock.patch.object(sys, "argv", base_args):
+                self.assertEqual(
+                    RUN_DOCTOR.parse_args().predecessor_workdir, "/tmp/environment"
+                )
+            with mock.patch.object(
+                sys, "argv", [*base_args, "--predecessor-workdir", "/tmp/explicit"]
+            ):
+                self.assertEqual(
+                    RUN_DOCTOR.parse_args().predecessor_workdir, "/tmp/explicit"
+                )
 
     def test_reuses_direct_predecessor_file_and_rebases_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -509,6 +533,44 @@ class PredecessorReuseTests(unittest.TestCase):
             self.assertFalse(was_reused)
             self.assertFalse(output_path.exists())
             self.assertIn("[REUSE MISS]", "\n".join(logs.output))
+
+    def test_unsafe_predecessor_evidence_falls_back_to_fresh_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            predecessor = root / "predecessor"
+            current = root / "current"
+            outside_evidence = root / "outside.log"
+            outside_evidence.write_text("timed out waiting for the condition\n")
+            output_name = RUN_DOCTOR._analysis_output_name(
+                "periodic-ci-example", "12345", release="4.20"
+            )
+            predecessor_output = predecessor / "jobs" / output_name
+            predecessor_output.parent.mkdir(parents=True)
+            predecessor_output.write_text(
+                json.dumps([valid_rca_entry(outside_evidence)])
+            )
+            output_path = current / "jobs" / output_name
+            output_path.parent.mkdir(parents=True)
+
+            with mock.patch.object(
+                RUN_DOCTOR,
+                "_run_fresh_analysis",
+                return_value=(None, False, ["fresh analysis was run"], {}),
+            ) as fresh_analysis:
+                result = RUN_DOCTOR._analyze_single_job(
+                    {"output_name": output_name},
+                    plugin_dir="",
+                    model="",
+                    agent_system_prompt="",
+                    logs_dir="",
+                    workdir=current,
+                    predecessor_workdir=predecessor,
+                )
+
+            fresh_analysis.assert_called_once()
+            self.assertFalse(result.reused)
+            self.assertFalse(result.saved)
+            self.assertEqual(result.validation_errors, ["fresh analysis was run"])
 
 
 if __name__ == "__main__":
