@@ -145,6 +145,8 @@ def parse_args():
                         help="Include pull request analysis")
     parser.add_argument("--repo",
                         help="GitHub org/repo for source checkout (e.g. openshift/microshift)")
+    parser.add_argument("--predecessor-workdir",
+                        help="Path to a predecessor run's workdir for RCA reuse")
     return parser.parse_args()
 
 
@@ -193,6 +195,7 @@ class DoctorPipeline:
 
         self.prepare_summary = None
         self.analyze_costs = {}
+        self.predecessor_workdir = args.predecessor_workdir
 
     @property
     def agent_system_prompt(self):
@@ -474,6 +477,7 @@ class DoctorPipeline:
 
         log.info("Analyzing %d jobs (max %d parallel)...", len(jobs), self.max_parallel)
 
+        _load_validate_module()
         results = {}
         with ThreadPoolExecutor(max_workers=self.max_parallel) as pool:
             futures = {}
@@ -486,6 +490,7 @@ class DoctorPipeline:
                     agent_system_prompt=self.agent_system_prompt,
                     logs_dir=str(self.logs_dir),
                     workdir=str(self.workdir),
+                    predecessor_workdir=self.predecessor_workdir,
                 )
                 futures[future] = job_info
 
@@ -828,6 +833,30 @@ def _extract_result_text_standalone(log_path):
     return _load_validate_module()._extract_last_assistant_message_from_transcript(log_path)
 
 
+def _reuse_predecessor_analysis(output_path, predecessor_workdir):
+    """Reuse a valid matching predecessor RCA file, if available."""
+    if not predecessor_workdir:
+        return False
+
+    predecessor_output = Path(predecessor_workdir) / "jobs" / output_path.name
+    try:
+        text = predecessor_output.read_text()
+        data = json.loads(text)
+        errors = _run_validation(text)
+        if errors:
+            raise ValueError("; ".join(errors))
+        temporary_output = output_path.with_suffix(".json.tmp")
+        temporary_output.write_text(json.dumps(data, indent=2))
+        temporary_output.replace(output_path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        log.info("[REUSE MISS] Could not reuse %s: %s; running fresh analysis",
+                 predecessor_output, exc)
+        return False
+
+    log.info("[REUSE] Reused predecessor analysis %s", predecessor_output)
+    return True
+
+
 def _extract_job_stats(log_path):
     """Extract cost, stop hook count, turn count, and permission denials from a stream-json log."""
     cost_usd = 0
@@ -957,7 +986,7 @@ def _run_claude_session(prompt, system_prompt, plugin_dir, model, log_path,
 
 
 def _analyze_single_job(job_info, plugin_dir, model, agent_system_prompt,
-                        logs_dir, workdir):
+                        logs_dir, workdir, predecessor_workdir=None):
     """Analyze a single prow job via claude -p. Called in a subprocess."""
     prompt_parts = [
         "Analyze this prow job:",
@@ -975,6 +1004,9 @@ def _analyze_single_job(job_info, plugin_dir, model, agent_system_prompt,
     log_stem = Path(job_info["log_name"]).stem
     debug_file = str(Path(logs_dir) / f"{log_stem}-debug.log")
     output_path = Path(workdir) / "jobs" / job_info["output_name"]
+    if _reuse_predecessor_analysis(output_path, predecessor_workdir):
+        return True, str(output_path), [], {"cost_usd": 0, "duration_ms": 0}
+    output_path.unlink(missing_ok=True)
     limits = STAGE_LIMITS["analyze"]
 
     env = os.environ.copy()
