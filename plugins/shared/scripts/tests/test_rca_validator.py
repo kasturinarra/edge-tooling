@@ -1,4 +1,5 @@
-"""Regression tests for RCA validation and predecessor file handoff.
+#!/usr/bin/env python3
+"""Regression tests for validate-rca-output.py hook detection.
 
 Zero-dependency (stdlib unittest + subprocess + tempfile). Run with:
 
@@ -15,7 +16,6 @@ Guards against the shape-detection regression where a main-agent Stop payload
 blocked every ordinary turn.
 """
 
-import importlib.util
 import json
 import os
 import subprocess
@@ -23,21 +23,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent.parent / "validate-rca-output.py"
-RUN_DOCTOR_SCRIPT = Path(__file__).resolve().parent.parent / "run-doctor.py"
-
-
-def load_run_doctor():
-    """Load the shared doctor runner, whose filename contains a dash."""
-    spec = importlib.util.spec_from_file_location("run_doctor", RUN_DOCTOR_SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-RUN_DOCTOR = load_run_doctor()
 
 
 def run_hook(payload, extra_env=None):
@@ -53,7 +40,6 @@ def run_hook(payload, extra_env=None):
         capture_output=True,
         text=True,
         env=env,
-        check=False,
     )
     return proc.returncode, proc.stdout
 
@@ -127,7 +113,9 @@ class HookDetectionTests(unittest.TestCase):
 
     def test_subagentstop_valid_passes(self):
         """A well-formed one-entry RCA array must not block."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".log", delete=False
+        ) as f:
             f.write("timed out waiting for the condition\n")
             evidence_path = f.name
         try:
@@ -147,7 +135,9 @@ class HookDetectionTests(unittest.TestCase):
             "type": "assistant",
             "message": {"content": [{"type": "text", "text": "not json"}]},
         }
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False
+        ) as f:
             f.write(json.dumps(record) + "\n")
             transcript_path = f.name
         try:
@@ -167,8 +157,10 @@ class HtmlEntityNormalizationTests(unittest.TestCase):
 
     def test_html_entities_in_file_match_plain_quote(self):
         """A file line with &#34; entities should match a plain-text quote."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
-            f.write("services &#34;prometheus-k8s&#34; not found\n")
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".log", delete=False
+        ) as f:
+            f.write('services &#34;prometheus-k8s&#34; not found\n')
             evidence_path = f.name
         try:
             entry = valid_rca_entry(evidence_path)
@@ -191,8 +183,10 @@ class HtmlEntityNormalizationTests(unittest.TestCase):
 
     def test_amp_lt_gt_entities_match(self):
         """&amp; &lt; &gt; in file should match plain &, <, > in quote."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
-            f.write("if x &lt; 0 &amp;&amp; y &gt; 1\n")
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".log", delete=False
+        ) as f:
+            f.write('if x &lt; 0 &amp;&amp; y &gt; 1\n')
             evidence_path = f.name
         try:
             entry = valid_rca_entry(evidence_path)
@@ -224,22 +218,16 @@ class StructuredGapTests(unittest.TestCase):
 
     def test_structured_gaps_accepted(self):
         """Structured gap objects with valid reason enum should pass validation."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".log", delete=False
+        ) as f:
             f.write("timed out waiting for the condition\n")
             evidence_path = f.name
         try:
             entry = self._make_entry_with_gaps(
                 [
-                    {
-                        "gap": "sosreport not extracted",
-                        "reason": "deprioritized",
-                        "detail": "turn budget exhausted",
-                    },
-                    {
-                        "gap": "pod logs missing",
-                        "reason": "artifact_unavailable",
-                        "detail": "",
-                    },
+                    {"gap": "sosreport not extracted", "reason": "deprioritized", "detail": "turn budget exhausted"},
+                    {"gap": "pod logs missing", "reason": "artifact_unavailable", "detail": ""},
                 ],
                 evidence_path,
             )
@@ -255,7 +243,9 @@ class StructuredGapTests(unittest.TestCase):
 
     def test_string_gaps_still_accepted(self):
         """Plain string gaps (old format) must still pass validation."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".log", delete=False
+        ) as f:
             f.write("timed out waiting for the condition\n")
             evidence_path = f.name
         try:
@@ -275,18 +265,16 @@ class StructuredGapTests(unittest.TestCase):
 
     def test_mixed_gaps_accepted(self):
         """Mix of string and object gaps must pass validation."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".log", delete=False
+        ) as f:
             f.write("timed out waiting for the condition\n")
             evidence_path = f.name
         try:
             entry = self._make_entry_with_gaps(
                 [
                     "plain string gap",
-                    {
-                        "gap": "structured gap",
-                        "reason": "out_of_scope",
-                        "detail": "beyond agent tools",
-                    },
+                    {"gap": "structured gap", "reason": "out_of_scope", "detail": "beyond agent tools"},
                 ],
                 evidence_path,
             )
@@ -302,7 +290,9 @@ class StructuredGapTests(unittest.TestCase):
 
     def test_invalid_reason_blocks(self):
         """Structured gap with invalid reason enum must block."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".log", delete=False
+        ) as f:
             f.write("timed out waiting for the condition\n")
             evidence_path = f.name
         try:
@@ -322,7 +312,9 @@ class StructuredGapTests(unittest.TestCase):
 
     def test_empty_gap_text_blocks(self):
         """Structured gap with empty 'gap' field must block."""
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".log", delete=False
+        ) as f:
             f.write("timed out waiting for the condition\n")
             evidence_path = f.name
         try:
@@ -343,13 +335,12 @@ class StructuredGapTests(unittest.TestCase):
     def test_all_reason_enums_accepted(self):
         """All valid reason enum values must be accepted."""
         valid_reasons = [
-            "artifact_unavailable",
-            "extraction_failed",
-            "deprioritized",
-            "not_realized",
-            "out_of_scope",
+            "artifact_unavailable", "extraction_failed",
+            "deprioritized", "not_realized", "out_of_scope",
         ]
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".log", delete=False
+        ) as f:
             f.write("timed out waiting for the condition\n")
             evidence_path = f.name
         try:
@@ -370,207 +361,6 @@ class StructuredGapTests(unittest.TestCase):
                 )
         finally:
             os.unlink(evidence_path)
-
-
-class PredecessorReuseTests(unittest.TestCase):
-    """Regression coverage for direct predecessor analysis-file handoff."""
-
-    def test_stable_output_names_use_safe_job_name_and_build_id(self):
-        self.assertEqual(
-            RUN_DOCTOR._analysis_output_name(
-                "periodic/ci example", "12345", release="4.20"
-            ),
-            "release-4.20-job-periodic-ci-example-12345.json",
-        )
-        self.assertEqual(
-            RUN_DOCTOR._analysis_output_name(
-                "pull ci/example", "67890", pr_number="42"
-            ),
-            "prs-job-pr42-pull-ci-example-67890.json",
-        )
-        self.assertNotEqual(
-            RUN_DOCTOR._analysis_output_name(
-                "periodic-ci-example", "12345", release="4.20"
-            ),
-            RUN_DOCTOR._analysis_output_name(
-                "periodic-ci-example", "12345", pr_number="42"
-            ),
-        )
-
-    def test_predecessor_workdir_accepts_cli_and_environment(self):
-        base_args = ["run-doctor.py", "--releases", "main", "--workdir", "/tmp/current"]
-        with mock.patch.dict(
-            os.environ, {"CI_DOCTOR_PREDECESSOR_WORKDIR": "/tmp/environment"}
-        ):
-            with mock.patch.object(sys, "argv", base_args):
-                self.assertEqual(
-                    RUN_DOCTOR.parse_args().predecessor_workdir, "/tmp/environment"
-                )
-            with mock.patch.object(
-                sys, "argv", [*base_args, "--predecessor-workdir", "/tmp/explicit"]
-            ):
-                self.assertEqual(
-                    RUN_DOCTOR.parse_args().predecessor_workdir, "/tmp/explicit"
-                )
-
-    def test_reuses_direct_predecessor_file_and_rebases_evidence(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            predecessor = root / "predecessor"
-            current = root / "current"
-            predecessor_evidence = predecessor / "artifacts" / "12345" / "build-log.txt"
-            current_evidence = current / "artifacts" / "12345" / "build-log.txt"
-            predecessor_evidence.parent.mkdir(parents=True)
-            current_evidence.parent.mkdir(parents=True)
-            predecessor_evidence.write_text("timed out waiting for the condition\n")
-            current_evidence.write_text("timed out waiting for the condition\n")
-
-            output_name = RUN_DOCTOR._analysis_output_name(
-                "periodic-ci-example", "12345", release="4.20"
-            )
-            predecessor_output = predecessor / "jobs" / output_name
-            predecessor_output.parent.mkdir()
-            predecessor_output.write_text(
-                json.dumps([valid_rca_entry(predecessor_evidence)])
-            )
-            output_path = current / "jobs" / output_name
-            output_path.parent.mkdir()
-
-            job_info = {"output_name": output_name}
-            with mock.patch.object(
-                RUN_DOCTOR,
-                "_run_fresh_analysis",
-                side_effect=AssertionError(
-                    "fresh analysis must not run when reuse succeeds"
-                ),
-            ):
-                result = RUN_DOCTOR._analyze_single_job(
-                    job_info,
-                    plugin_dir="",
-                    model="",
-                    agent_system_prompt="",
-                    logs_dir="",
-                    workdir=current,
-                    predecessor_workdir=predecessor,
-                )
-
-            self.assertTrue(result.reused)
-            self.assertTrue(result.saved)
-            reused = json.loads(output_path.read_text())
-            self.assertEqual(
-                reused[0]["causal_chain"][0]["evidence"],
-                f"{current_evidence}:1",
-            )
-            self.assertEqual(json.loads(output_path.read_text()), reused)
-
-    def test_malformed_predecessor_file_is_a_reuse_miss(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            predecessor = root / "predecessor"
-            current = root / "current"
-            output_name = RUN_DOCTOR._analysis_output_name(
-                "periodic-ci-example", "12345", release="4.20"
-            )
-            predecessor_output = predecessor / "jobs" / output_name
-            predecessor_output.parent.mkdir(parents=True)
-            predecessor_output.write_text("not json")
-            output_path = current / "jobs" / output_name
-            output_path.parent.mkdir(parents=True)
-
-            reused, was_reused = RUN_DOCTOR._reuse_predecessor_analysis(
-                output_path, predecessor, current
-            )
-
-            self.assertIsNone(reused)
-            self.assertFalse(was_reused)
-            self.assertFalse(output_path.exists())
-
-    def test_validation_failing_predecessor_file_is_a_reuse_miss(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            predecessor = root / "predecessor"
-            current = root / "current"
-            output_name = RUN_DOCTOR._analysis_output_name(
-                "periodic-ci-example", "12345", release="4.20"
-            )
-            predecessor_output = predecessor / "jobs" / output_name
-            predecessor_output.parent.mkdir(parents=True)
-            predecessor_output.write_text("[]")
-            output_path = current / "jobs" / output_name
-            output_path.parent.mkdir(parents=True)
-
-            with self.assertLogs("doctor", level="INFO") as logs:
-                reused, was_reused = RUN_DOCTOR._reuse_predecessor_analysis(
-                    output_path, predecessor, current
-                )
-
-            self.assertIsNone(reused)
-            self.assertFalse(was_reused)
-            self.assertFalse(output_path.exists())
-            self.assertIn("[REUSE MISS]", "\n".join(logs.output))
-
-    def test_unsafe_predecessor_jobs_path_is_a_reuse_miss(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            predecessor = root / "predecessor"
-            current = root / "current"
-            outside_jobs = root / "outside-jobs"
-            predecessor.mkdir()
-            outside_jobs.mkdir()
-            (predecessor / "jobs").symlink_to(outside_jobs, target_is_directory=True)
-            output_name = RUN_DOCTOR._analysis_output_name(
-                "periodic-ci-example", "12345", release="4.20"
-            )
-            output_path = current / "jobs" / output_name
-            output_path.parent.mkdir(parents=True)
-
-            with self.assertLogs("doctor", level="WARNING") as logs:
-                reused, was_reused = RUN_DOCTOR._reuse_predecessor_analysis(
-                    output_path, predecessor, current
-                )
-
-            self.assertIsNone(reused)
-            self.assertFalse(was_reused)
-            self.assertFalse(output_path.exists())
-            self.assertIn("[REUSE MISS]", "\n".join(logs.output))
-
-    def test_unsafe_predecessor_evidence_falls_back_to_fresh_analysis(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            predecessor = root / "predecessor"
-            current = root / "current"
-            outside_evidence = root / "outside.log"
-            outside_evidence.write_text("timed out waiting for the condition\n")
-            output_name = RUN_DOCTOR._analysis_output_name(
-                "periodic-ci-example", "12345", release="4.20"
-            )
-            predecessor_output = predecessor / "jobs" / output_name
-            predecessor_output.parent.mkdir(parents=True)
-            predecessor_output.write_text(
-                json.dumps([valid_rca_entry(outside_evidence)])
-            )
-            output_path = current / "jobs" / output_name
-            output_path.parent.mkdir(parents=True)
-
-            with mock.patch.object(
-                RUN_DOCTOR,
-                "_run_fresh_analysis",
-                return_value=(None, False, ["fresh analysis was run"], {}),
-            ) as fresh_analysis:
-                result = RUN_DOCTOR._analyze_single_job(
-                    {"output_name": output_name},
-                    plugin_dir="",
-                    model="",
-                    agent_system_prompt="",
-                    logs_dir="",
-                    workdir=current,
-                    predecessor_workdir=predecessor,
-                )
-
-            fresh_analysis.assert_called_once()
-            self.assertFalse(result.reused)
-            self.assertFalse(result.saved)
-            self.assertEqual(result.validation_errors, ["fresh analysis was run"])
 
 
 if __name__ == "__main__":

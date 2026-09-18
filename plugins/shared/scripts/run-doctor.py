@@ -17,11 +17,10 @@ import re
 import signal
 import subprocess
 import sys
-import textwrap
 import threading
+import time
+import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from functools import cached_property
 from pathlib import Path
 
 log = logging.getLogger("doctor")
@@ -65,38 +64,6 @@ STAGE_LIMITS = {
     "bugs": {"max_turns": 50, "timeout": 900},
 }
 
-
-def _safe_filename_component(value):
-    """Return a stable filesystem-safe representation of *value*."""
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value)).strip(".-")
-    return safe or "unknown"
-
-
-def _analysis_output_name(job_name, build_id, *, release=None, pr_number=None):
-    """Build a stable per-job RCA filename from the exact job name and build ID."""
-    job_part = _safe_filename_component(job_name)
-    build_part = _safe_filename_component(build_id)
-    if release is not None:
-        return (
-            f"release-{_safe_filename_component(release)}-job-"
-            f"{job_part}-{build_part}.json"
-        )
-    return (
-        f"prs-job-pr{_safe_filename_component(pr_number)}-{job_part}-{build_part}.json"
-    )
-
-
-@dataclass
-class JobAnalysisResult:
-    """Execution result for one job analysis."""
-
-    saved: bool
-    output_path: object
-    validation_errors: list
-    stats: dict
-    reused: bool
-
-
 DOCTOR_SH_TIMEOUT = {
     "prepare": 1800,
     "graphs": 600,
@@ -130,7 +97,7 @@ def detect_plugin_dir():
     invoked = Path(sys.argv[0]).absolute()
     for i, part in enumerate(invoked.parts):
         if part in COMPONENT_MAP:
-            return str(Path(*invoked.parts[: i + 1]))
+            return str(Path(*invoked.parts[:i + 1]))
     return None
 
 
@@ -139,7 +106,7 @@ def strip_frontmatter(text):
     if text.startswith("---"):
         end = text.find("\n---", 3)
         if end != -1:
-            return text[end + 4 :].lstrip("\n")
+            return text[end + 4:].lstrip("\n")
     return text
 
 
@@ -162,45 +129,27 @@ def parse_args():
                   --releases main --workdir /tmp/workdir --stages analyze,finalize
         """),
     )
-    parser.add_argument(
-        "--releases",
-        required=True,
-        help="Comma-separated release versions (e.g. 4.19,4.20,main)",
-    )
-    parser.add_argument(
-        "--workdir", required=True, help="Working directory for artifacts and logs"
-    )
-    parser.add_argument(
-        "--model",
-        default="claude-opus-4-6",
-        help="Claude model to use (default: claude-opus-4-6)",
-    )
-    parser.add_argument(
-        "--parallel",
-        type=int,
-        default=64,
-        help="Max parallel claude -p sessions (default: 64)",
-    )
-    parser.add_argument(
-        "--stages", help="Comma-separated stages to run (default: all for component)"
-    )
-    parser.add_argument(
-        "--component",
-        choices=["microshift", "lvm-operator"],
-        help="Override auto-detected component",
-    )
-    parser.add_argument(
-        "--pull-requests", action="store_true", help="Include pull request analysis"
-    )
-    parser.add_argument(
-        "--repo", help="GitHub org/repo for source checkout (e.g. openshift/microshift)"
-    )
-    parser.add_argument(
-        "--predecessor-workdir",
-        default=os.environ.get("CI_DOCTOR_PREDECESSOR_WORKDIR"),
-        help="Path to a predecessor run's workdir for RCA reuse "
-        "(also reads CI_DOCTOR_PREDECESSOR_WORKDIR env var)",
-    )
+    parser.add_argument("--releases", required=True,
+                        help="Comma-separated release versions (e.g. 4.19,4.20,main)")
+    parser.add_argument("--workdir", required=True,
+                        help="Working directory for artifacts and logs")
+    parser.add_argument("--model", default="claude-opus-4-6",
+                        help="Claude model to use (default: claude-opus-4-6)")
+    parser.add_argument("--parallel", type=int, default=64,
+                        help="Max parallel claude -p sessions (default: 64)")
+    parser.add_argument("--stages",
+                        help="Comma-separated stages to run (default: all for component)")
+    parser.add_argument("--component",
+                        choices=["microshift", "lvm-operator"],
+                        help="Override auto-detected component")
+    parser.add_argument("--pull-requests", action="store_true",
+                        help="Include pull request analysis")
+    parser.add_argument("--repo",
+                        help="GitHub org/repo for source checkout (e.g. openshift/microshift)")
+    parser.add_argument("--predecessor-workdir",
+                        default=os.environ.get("CI_DOCTOR_PREDECESSOR_WORKDIR"),
+                        help="Path to a predecessor run's workdir for RCA reuse "
+                             "(also reads CI_DOCTOR_PREDECESSOR_WORKDIR env var)")
     return parser.parse_args()
 
 
@@ -230,12 +179,8 @@ class DoctorPipeline:
             requested = [s.strip() for s in args.stages.split(",")]
             invalid = [s for s in requested if s not in all_stages]
             if invalid:
-                log.error(
-                    "Invalid stages for %s: %s. Valid: %s",
-                    self.component,
-                    invalid,
-                    all_stages,
-                )
+                log.error("Invalid stages for %s: %s. Valid: %s",
+                          self.component, invalid, all_stages)
                 sys.exit(1)
             self.stages = requested
         else:
@@ -245,22 +190,22 @@ class DoctorPipeline:
         self.model = args.model
         self.max_parallel = args.parallel
 
-        self.agent_prompt_path = (
-            Path(self.plugin_dir) / "agents" / "prow-job-analyzer.md"
-        )
+        self.agent_prompt_path = Path(self.plugin_dir) / "agents" / "prow-job-analyzer.md"
         if "analyze" in self.stages and not self.agent_prompt_path.is_file():
             log.error("Agent prompt not found: %s", self.agent_prompt_path)
             sys.exit(1)
+        self._agent_system_prompt = None
+
         self.prepare_summary = None
         self.analyze_costs = {}
-
-        # Explicit predecessor handoff is optional and local to this run.
         self.predecessor_workdir = args.predecessor_workdir
 
-    @cached_property
+    @property
     def agent_system_prompt(self):
-        """Return the complete analyzer prompt without YAML frontmatter."""
-        return strip_frontmatter(self.agent_prompt_path.read_text())
+        if self._agent_system_prompt is None:
+            text = self.agent_prompt_path.read_text()
+            self._agent_system_prompt = strip_frontmatter(text)
+        return self._agent_system_prompt
 
     def message(self, msg):
         """Append a diagnostic message to diagnostics.txt and log it."""
@@ -272,13 +217,9 @@ class DoctorPipeline:
         """Run a doctor-helper.sh subcommand, streaming output live and to a log file."""
         doctor_sh = Path(self.plugin_dir) / "scripts" / "doctor-helper.sh"
         cmd = [
-            "bash",
-            str(doctor_sh),
-            subcommand,
-            "--component",
-            self.component,
-            "--workdir",
-            str(self.workdir),
+            "bash", str(doctor_sh), subcommand,
+            "--component", self.component,
+            "--workdir", str(self.workdir),
         ] + extra_args
 
         log_path = self.logs_dir / log_name
@@ -297,7 +238,6 @@ class DoctorPipeline:
                 )
                 _register_child(proc)
                 timed_out = False
-
                 def _kill():
                     nonlocal timed_out
                     timed_out = True
@@ -305,7 +245,6 @@ class DoctorPipeline:
                         os.killpg(proc.pid, signal.SIGTERM)
                     except OSError:
                         pass
-
                 timer = threading.Timer(timeout, _kill)
                 timer.start()
                 try:
@@ -322,30 +261,19 @@ class DoctorPipeline:
 
             stdout = "".join(output_lines)
             if timed_out:
-                self.message(
-                    f"ERROR: doctor-helper.sh {subcommand} timed out after {timeout}s"
-                )
+                self.message(f"ERROR: doctor-helper.sh {subcommand} timed out after {timeout}s")
                 return False, stdout
             if proc.returncode != 0:
-                self.message(
-                    f"ERROR: doctor-helper.sh {subcommand} exited with code {proc.returncode}"
-                )
+                self.message(f"ERROR: doctor-helper.sh {subcommand} exited with code {proc.returncode}")
                 return False, stdout
             return True, stdout
         except OSError as e:
             self.message(f"ERROR: doctor-helper.sh {subcommand} failed to start: {e}")
             return False, ""
 
-    def run_claude_session(
-        self,
-        prompt,
-        system_prompt,
-        log_path,
-        max_turns=30,
-        timeout=600,
-        allowed_tools=None,
-        add_dirs=None,
-    ):
+    def run_claude_session(self, prompt, system_prompt, log_path,
+                           max_turns=30, timeout=600,
+                           allowed_tools=None, add_dirs=None):
         """Run a claude -p session, writing stream-json to log_path.
 
         Returns (success, final_text) where final_text is the last assistant
@@ -363,9 +291,7 @@ class DoctorPipeline:
             add_dirs=add_dirs,
         )
         if success is None:
-            self.message(
-                f"ERROR: claude -p timed out after {timeout}s: {log_path.name}"
-            )
+            self.message(f"ERROR: claude -p timed out after {timeout}s: {log_path.name}")
             return False, None
         return success, final_text
 
@@ -424,9 +350,7 @@ class DoctorPipeline:
                 first_hook = stats.get("first_hook_at_turn", 0)
                 wasted = num_turns - first_hook if first_hook > 0 else 0
                 if wasted > 0:
-                    parts.append(
-                        f"stop hook fired {hooks}x ({wasted} turns wasted on retries)"
-                    )
+                    parts.append(f"stop hook fired {hooks}x ({wasted} turns wasted on retries)")
                 else:
                     parts.append(f"stop hook fired {hooks}x")
             lines.append(", ".join(parts))
@@ -556,8 +480,7 @@ class DoctorPipeline:
 
         log.info("Analyzing %d jobs (max %d parallel)...", len(jobs), self.max_parallel)
 
-        # Pre-load the validation module before spawning workers to avoid
-        # a lazy-init race under ThreadPoolExecutor (B-I1).
+        # Load validation before worker threads can reuse predecessor results.
         _load_validate_module()
 
         results = {}
@@ -580,35 +503,30 @@ class DoctorPipeline:
                 job_info = futures[future]
                 label = job_info["label"]
                 try:
-                    analysis_result = future.result()
+                    success, output_path, validation_errors, stats = future.result()
                     results[label] = {
-                        "success": analysis_result.saved,
-                        "output_path": analysis_result.output_path,
-                        "validation_errors": analysis_result.validation_errors,
-                        "stats": analysis_result.stats,
+                        "success": success,
+                        "output_path": output_path,
+                        "validation_errors": validation_errors,
+                        "stats": stats,
                     }
                     self.analyze_costs[job_info["log_name"]] = {
-                        "cost_usd": analysis_result.stats.get("cost_usd", 0),
-                        "duration_ms": analysis_result.stats.get("duration_ms", 0),
+                        "cost_usd": stats.get("cost_usd", 0),
+                        "duration_ms": stats.get("duration_ms", 0),
                     }
-
-                    if analysis_result.saved:
+                    if success:
                         log.info("[OK] %s", label)
                     else:
                         log.warning("[FAILED] %s", label)
-                    if analysis_result.validation_errors:
+                    if validation_errors:
                         self.message(
                             f"WARNING: Post-hoc validation failed for {label}:\n"
-                            + "\n".join(
-                                f"  - {e}" for e in analysis_result.validation_errors
-                            )
+                            + "\n".join(f"  - {e}" for e in validation_errors)
                         )
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     self.message(f"ERROR: {label} raised exception: {exc}")
                     results[label] = {
-                        "success": False,
-                        "output_path": None,
-                        "validation_errors": [],
+                        "success": False, "output_path": None, "validation_errors": [],
                         "stats": {"cost_usd": 0, "stop_hook_count": 0},
                     }
 
@@ -642,23 +560,20 @@ class DoctorPipeline:
                 build_id = job.get("build_id", f"unknown-{i}")
                 log_name = f"prow-job-analyzer-{release}-{build_id}.log"
                 output_name = _analysis_output_name(
-                    job.get("job", ""), build_id, release=release
-                )
-                jobs.append(
-                    {
-                        "label": f"{release}/{build_id}",
-                        "release": release,
-                        "artifacts_dir": job.get("artifacts_dir", ""),
-                        "job_url": job.get("url", ""),
-                        "job_name": job.get("job", ""),
-                        "build_id": build_id,
-                        "log_name": log_name,
-                        "output_name": output_name,
-                        "graphs_dir": self._graphs_dir(build_id),
-                        "source_dir": self._source_dir(release),
-                        "is_pr": False,
-                    }
-                )
+                    job.get("job", ""), build_id, release=release)
+                jobs.append({
+                    "label": f"{release}/{build_id}",
+                    "release": release,
+                    "artifacts_dir": job.get("artifacts_dir", ""),
+                    "job_url": job.get("url", ""),
+                    "job_name": job.get("job", ""),
+                    "build_id": build_id,
+                    "log_name": log_name,
+                    "output_name": output_name,
+                    "graphs_dir": self._graphs_dir(build_id),
+                    "source_dir": self._source_dir(release),
+                    "is_pr": False,
+                })
 
         pr_info = summary.get("prs", {})
         pr_jobs_file = pr_info.get("jobs_file")
@@ -679,23 +594,20 @@ class DoctorPipeline:
                 job_name = job.get("job", "")
                 log_name = f"prow-job-analyzer-pr{pr_number}-{build_id}.log"
                 output_name = _analysis_output_name(
-                    job_name, build_id, pr_number=pr_number
-                )
-                jobs.append(
-                    {
-                        "label": f"pr{pr_number}/{build_id}",
-                        "release": "prs",
-                        "artifacts_dir": job.get("artifacts_dir", ""),
-                        "job_url": job.get("url", ""),
-                        "job_name": job_name,
-                        "build_id": build_id,
-                        "log_name": log_name,
-                        "output_name": output_name,
-                        "graphs_dir": self._graphs_dir(build_id),
-                        "source_dir": self._source_dir("main"),
-                        "is_pr": True,
-                    }
-                )
+                    job_name, build_id, pr_number=pr_number)
+                jobs.append({
+                    "label": f"pr{pr_number}/{build_id}",
+                    "release": "prs",
+                    "artifacts_dir": job.get("artifacts_dir", ""),
+                    "job_url": job.get("url", ""),
+                    "job_name": job_name,
+                    "build_id": build_id,
+                    "log_name": log_name,
+                    "output_name": output_name,
+                    "graphs_dir": self._graphs_dir(build_id),
+                    "source_dir": self._source_dir("main"),
+                    "is_pr": True,
+                })
 
         return jobs
 
@@ -744,16 +656,8 @@ class DoctorPipeline:
             log_path=log_path,
             max_turns=limits["max_turns"],
             timeout=limits["timeout"],
-            allowed_tools=[
-                "Skill",
-                "Bash",
-                "Read",
-                "Write",
-                "Glob",
-                "Grep",
-                "mcp__jira__jira_search",
-                "mcp__jira__jira_get_issue",
-            ],
+            allowed_tools=["Skill", "Bash", "Read", "Write", "Glob", "Grep",
+                           "mcp__jira__jira_search", "mcp__jira__jira_get_issue"],
             add_dirs=[str(self.workdir)],
         )
         if not ok:
@@ -800,7 +704,7 @@ class DoctorPipeline:
                     stage = "analyze"
                     # prow-job-analyzer-<release>-<build_id> or
                     # prow-job-analyzer-pr<N>-<suffix>
-                    rest = name[len("prow-job-analyzer-") :]
+                    rest = name[len("prow-job-analyzer-"):]
                     if rest.startswith("pr"):
                         release = "PRs"
                     else:
@@ -811,24 +715,19 @@ class DoctorPipeline:
                 if stage not in costs["stages"]:
                     costs["stages"][stage] = {
                         "releases": {},
-                        "total_cost_usd": 0,
-                        "total_duration_ms": 0,
+                        "total_cost_usd": 0, "total_duration_ms": 0,
                     }
                 stage_data = costs["stages"][stage]
                 if release not in stage_data["releases"]:
                     stage_data["releases"][release] = {
-                        "jobs": [],
-                        "cost_usd": 0,
-                        "duration_ms": 0,
+                        "jobs": [], "cost_usd": 0, "duration_ms": 0,
                     }
                 rel_data = stage_data["releases"][release]
-                rel_data["jobs"].append(
-                    {
-                        "name": name,
-                        "cost_usd": cost_info["cost_usd"],
-                        "duration_ms": cost_info["duration_ms"],
-                    }
-                )
+                rel_data["jobs"].append({
+                    "name": name,
+                    "cost_usd": cost_info["cost_usd"],
+                    "duration_ms": cost_info["duration_ms"],
+                })
                 rel_data["cost_usd"] += cost_info["cost_usd"]
                 rel_data["duration_ms"] += cost_info["duration_ms"]
                 stage_data["total_cost_usd"] += cost_info["cost_usd"]
@@ -853,9 +752,7 @@ class DoctorPipeline:
                 n = len(rel_data["jobs"])
                 cost = rel_data["cost_usd"]
                 avg = cost / n if n else 0
-                lines.append(
-                    f"    {release}: {n} jobs, ${cost:.2f} (avg ${avg:.3f}/job)"
-                )
+                lines.append(f"    {release}: {n} jobs, ${cost:.2f} (avg ${avg:.3f}/job)")
             total_jobs = sum(len(r["jobs"]) for r in data["releases"].values())
             lines.append(f"    Total: {total_jobs} jobs, ${data['total_cost_usd']:.2f}")
         lines.append(f"  Grand Total: ${costs['total_cost_usd']:.2f}")
@@ -923,7 +820,6 @@ def _load_validate_module():
     global _validate_module
     if _validate_module is None:
         import importlib.util
-
         script = Path(__file__).resolve().parent / "validate-rca-output.py"
         spec = importlib.util.spec_from_file_location("validate_rca_output", script)
         mod = importlib.util.module_from_spec(spec)
@@ -941,9 +837,7 @@ def _parse_json_output(text):
 
 
 def _extract_result_text_standalone(log_path):
-    return _load_validate_module()._extract_last_assistant_message_from_transcript(
-        log_path
-    )
+    return _load_validate_module()._extract_last_assistant_message_from_transcript(log_path)
 
 
 def _extract_job_stats(log_path):
@@ -976,26 +870,16 @@ def _extract_job_stats(log_path):
                     denials = record.get("permission_denials")
                     if isinstance(denials, list):
                         permission_denials = len(denials)
-                elif record.get("type") == "assistant" and not record.get(
-                    "parent_tool_use_id"
-                ):
+                elif record.get("type") == "assistant" and not record.get("parent_tool_use_id"):
                     msg = record.get("message", {})
                     if isinstance(msg, dict):
                         for block in msg.get("content", []):
-                            if (
-                                isinstance(block, dict)
-                                and block.get("type") == "text"
-                                and block.get("text", "").strip()
-                                == "Prompt is too long"
-                            ):
-                                context_exhausted = True
-                elif record.get("type") == "assistant" and record.get(
-                    "parent_tool_use_id"
-                ):
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                if block.get("text", "").strip() == "Prompt is too long":
+                                    context_exhausted = True
+                elif record.get("type") == "assistant" and record.get("parent_tool_use_id"):
                     subagent_turns += 1
-                elif record.get("type") == "user" and not record.get(
-                    "parent_tool_use_id"
-                ):
+                elif record.get("type") == "user" and not record.get("parent_tool_use_id"):
                     is_hook = False
                     if record.get("isSynthetic"):
                         msg = record.get("message", {})
@@ -1003,11 +887,7 @@ def _extract_job_stats(log_path):
                             content = msg.get("content", [])
                             if isinstance(content, list):
                                 for block in content:
-                                    if isinstance(
-                                        block, dict
-                                    ) and "Stop hook feedback:" in block.get(
-                                        "text", ""
-                                    ):
+                                    if isinstance(block, dict) and "Stop hook feedback:" in block.get("text", ""):
                                         is_hook = True
                                         break
                     if is_hook:
@@ -1017,31 +897,18 @@ def _extract_job_stats(log_path):
                     parent_user_msgs += 1
     except OSError:
         pass
-    return {
-        "cost_usd": cost_usd,
-        "duration_ms": duration_ms,
-        "stop_hook_count": stop_hook_count,
-        "num_turns": num_turns,
-        "subagent_turns": subagent_turns,
-        "permission_denials": permission_denials,
-        "first_hook_at_turn": first_hook_at_turn,
-        "context_exhausted": context_exhausted,
-    }
+    return {"cost_usd": cost_usd, "duration_ms": duration_ms,
+            "stop_hook_count": stop_hook_count,
+            "num_turns": num_turns, "subagent_turns": subagent_turns,
+            "permission_denials": permission_denials,
+            "first_hook_at_turn": first_hook_at_turn,
+            "context_exhausted": context_exhausted}
 
 
-def _run_claude_session(
-    prompt,
-    system_prompt,
-    plugin_dir,
-    model,
-    log_path,
-    max_turns=30,
-    timeout=600,
-    env=None,
-    allowed_tools=None,
-    add_dirs=None,
-    debug_file=None,
-):
+def _run_claude_session(prompt, system_prompt, plugin_dir, model, log_path,
+                        max_turns=30, timeout=600, env=None,
+                        allowed_tools=None, add_dirs=None,
+                        debug_file=None):
     """Run a claude -p session, writing stream-json to log_path.
 
     Returns (success, final_text). Returns (None, None) on timeout.
@@ -1051,24 +918,17 @@ def _run_claude_session(
     # the primary agent IS the analyzer and should do the work directly.
     system_prompt += (
         "\n\nDo NOT spawn or delegate to the prow-job-analyzer subagent"
-        " - YOU are the analyzer. Do the analysis yourself and output"
+        " — YOU are the analyzer. Do the analysis yourself and output"
         " the JSON array directly."
     )
 
     cmd = [
-        "claude",
-        "-p",
-        prompt,
-        "--append-system-prompt",
-        system_prompt,
-        "--plugin-dir",
-        plugin_dir,
-        "--model",
-        model,
-        "--max-turns",
-        str(max_turns),
-        "--output-format",
-        "stream-json",
+        "claude", "-p", prompt,
+        "--append-system-prompt", system_prompt,
+        "--plugin-dir", plugin_dir,
+        "--model", model,
+        "--max-turns", str(max_turns),
+        "--output-format", "stream-json",
         "--forward-subagent-text",
         "--verbose",
     ]
@@ -1108,21 +968,29 @@ def _run_claude_session(
         return False, None
 
 
+def _safe_filename_component(value):
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value)).strip(".-")
+    return safe or "unknown"
+
+
+def _analysis_output_name(job_name, build_id, *, release=None, pr_number=None):
+    job_part = _safe_filename_component(job_name)
+    build_part = _safe_filename_component(build_id)
+    if release is not None:
+        return f"release-{_safe_filename_component(release)}-job-{job_part}-{build_part}.json"
+    return f"prs-job-pr{_safe_filename_component(pr_number)}-{job_part}-{build_part}.json"
+
+
 def _empty_job_stats():
-    """Return zero-valued execution statistics for a reused analysis."""
     return {
-        "cost_usd": 0,
-        "duration_ms": 0,
-        "stop_hook_count": 0,
-        "num_turns": 0,
-        "permission_denials": 0,
-        "first_hook_at_turn": 0,
-        "context_exhausted": False,
+        "cost_usd": 0, "duration_ms": 0, "stop_hook_count": 0,
+        "num_turns": 0, "subagent_turns": 0, "permission_denials": 0,
+        "first_hook_at_turn": 0, "context_exhausted": False,
     }
 
 
 def rebase_evidence_paths(rca_output, old_workdir, new_workdir):
-    """Rebase evidence inside *old_workdir*, reporting unsafe citations."""
+    """Rebase citations within the predecessor workdir, rejecting unsafe paths."""
     old_root = Path(old_workdir).resolve()
     new_root = Path(new_workdir).resolve()
     unsafe_evidence = []
@@ -1143,7 +1011,6 @@ def rebase_evidence_paths(rca_output, old_workdir, new_workdir):
             evidence = link.get("evidence", "")
             if not isinstance(evidence, str):
                 continue
-
             match = re.fullmatch(r"(.+):(\d+)", evidence)
             if not match:
                 continue
@@ -1157,7 +1024,6 @@ def rebase_evidence_paths(rca_output, old_workdir, new_workdir):
             except (OSError, ValueError):
                 unsafe_evidence.append(evidence)
                 continue
-
             new_path = new_root / relative_path
             try:
                 new_path.resolve(strict=True).relative_to(new_root)
@@ -1170,16 +1036,14 @@ def rebase_evidence_paths(rca_output, old_workdir, new_workdir):
 
 
 def _reuse_predecessor_analysis(output_path, predecessor_workdir, workdir):
-    """Reuse a valid direct predecessor RCA file, otherwise return a reuse miss."""
+    """Copy a valid direct predecessor RCA file or report a reuse miss."""
     if not predecessor_workdir:
         return None, False
 
     predecessor_root = Path(predecessor_workdir).resolve()
     if not predecessor_root.is_dir():
-        log.info(
-            "[REUSE MISS] Predecessor workdir does not exist: %s; running fresh analysis",
-            predecessor_root,
-        )
+        log.info("[REUSE MISS] Predecessor workdir does not exist: %s; running fresh analysis",
+                 predecessor_root)
         return None, False
 
     predecessor_jobs = (predecessor_root / "jobs").resolve()
@@ -1188,62 +1052,41 @@ def _reuse_predecessor_analysis(output_path, predecessor_workdir, workdir):
         predecessor_jobs.relative_to(predecessor_root)
         predecessor_output.relative_to(predecessor_jobs)
     except ValueError:
-        log.warning(
-            "[REUSE MISS] Unsafe predecessor analysis path for %s; running fresh analysis",
-            output_path.name,
-        )
+        log.warning("[REUSE MISS] Unsafe predecessor analysis path for %s; running fresh analysis",
+                    output_path.name)
         return None, False
 
     if not predecessor_output.is_file():
-        log.info(
-            "[REUSE MISS] No predecessor analysis at %s; running fresh analysis",
-            predecessor_output,
-        )
+        log.info("[REUSE MISS] No predecessor analysis at %s; running fresh analysis",
+                 predecessor_output)
         return None, False
 
     try:
-        predecessor_output_data = json.loads(predecessor_output.read_text())
+        data = json.loads(predecessor_output.read_text())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        log.warning(
-            "[REUSE MISS] Could not load predecessor analysis %s: %s; "
-            "running fresh analysis",
-            predecessor_output,
-            exc,
-        )
+        log.warning("[REUSE MISS] Could not load predecessor analysis %s: %s; "
+                    "running fresh analysis", predecessor_output, exc)
         return None, False
 
-    rebased, unsafe_evidence = rebase_evidence_paths(
-        predecessor_output_data, predecessor_root, workdir
-    )
+    rebased, unsafe_evidence = rebase_evidence_paths(data, predecessor_root, workdir)
     if not isinstance(rebased, list):
-        log.warning(
-            "[REUSE MISS] Predecessor analysis %s is %s, not an RCA JSON array; "
-            "running fresh analysis",
-            predecessor_output,
-            type(rebased).__name__,
-        )
+        log.warning("[REUSE MISS] Predecessor analysis %s is %s, not an RCA JSON array; "
+                    "running fresh analysis", predecessor_output, type(rebased).__name__)
         return None, False
-
     if unsafe_evidence:
-        log.warning(
-            "[REUSE MISS] Predecessor analysis %s has unsafe evidence paths; "
-            "running fresh analysis",
-            predecessor_output,
-        )
+        log.warning("[REUSE MISS] Predecessor analysis %s has unsafe evidence paths; "
+                    "running fresh analysis", predecessor_output)
         return None, False
 
     validation_errors = _run_validation(json.dumps(rebased))
     if validation_errors:
-        log.info(
-            "[REUSE MISS] Predecessor analysis %s failed validation; "
-            "running fresh analysis",
-            predecessor_output,
-        )
+        log.info("[REUSE MISS] Predecessor analysis %s failed validation; "
+                 "running fresh analysis", predecessor_output)
         return None, False
 
     try:
-        with open(output_path, "w") as output_file:
-            json.dump(rebased, output_file, indent=2)
+        with open(output_path, "w") as f:
+            json.dump(rebased, f, indent=2)
     except OSError as exc:
         log.warning("[REUSE MISS] Failed to write reused output: %s", exc)
         return None, False
@@ -1252,10 +1095,9 @@ def _reuse_predecessor_analysis(output_path, predecessor_workdir, workdir):
     return rebased, True
 
 
-def _run_fresh_analysis(
-    job_info, plugin_dir, model, agent_system_prompt, logs_dir, output_path
-):
-    """Run Claude for one job and return its output, validation, and statistics."""
+def _analyze_single_job(job_info, plugin_dir, model, agent_system_prompt,
+                        logs_dir, workdir, predecessor_workdir=None):
+    """Analyze a single prow job via claude -p. Called in a subprocess."""
     prompt_parts = [
         "Analyze this prow job:",
         f"artifacts_dir: {job_info['artifacts_dir']}",
@@ -1267,24 +1109,30 @@ def _run_fresh_analysis(
     if job_info.get("source_dir"):
         prompt_parts.append(f"source_dir: {job_info['source_dir']}")
 
+    prompt = "\n".join(prompt_parts)
     log_path = Path(logs_dir) / job_info["log_name"]
     log_stem = Path(job_info["log_name"]).stem
+    debug_file = str(Path(logs_dir) / f"{log_stem}-debug.log")
+    output_path = Path(workdir) / "jobs" / job_info["output_name"]
+    _, reused = _reuse_predecessor_analysis(
+        output_path, predecessor_workdir, workdir)
+    if reused:
+        return True, str(output_path), [], _empty_job_stats()
+    limits = STAGE_LIMITS["analyze"]
+
     env = os.environ.copy()
     env["CI_DOCTOR_RCA_SESSION"] = "1"
     env["CI_DOCTOR_HOOK_LOG"] = str(Path(logs_dir) / f"{log_stem}-hook.log")
     env["CLAUDE_CODE_DEBUG_LOG_LEVEL"] = "verbose"
-    add_dirs = [
-        directory
-        for directory in [
-            job_info.get("artifacts_dir"),
-            job_info.get("graphs_dir"),
-            job_info.get("source_dir"),
-        ]
-        if directory
-    ]
-    limits = STAGE_LIMITS["analyze"]
+
+    add_dirs = [d for d in [
+        job_info.get("artifacts_dir"),
+        job_info.get("graphs_dir"),
+        job_info.get("source_dir"),
+    ] if d]
+
     success, final_text = _run_claude_session(
-        prompt="\n".join(prompt_parts),
+        prompt=prompt,
         system_prompt=agent_system_prompt,
         plugin_dir=plugin_dir,
         model=model,
@@ -1294,61 +1142,32 @@ def _run_fresh_analysis(
         env=env,
         allowed_tools=["Bash", "Read", "Glob", "Grep"],
         add_dirs=add_dirs,
-        debug_file=str(Path(logs_dir) / f"{log_stem}-debug.log"),
+        debug_file=debug_file,
     )
 
-    validation_errors = []
-    if success is None:
+    timed_out = success is None
+    if timed_out:
         final_text = _extract_result_text_standalone(log_path)
+
+    validation_errors = []
+    if timed_out:
         validation_errors.append(f"Timed out after {limits['timeout']}s")
 
-    rca_output = None
     saved = False
     if final_text:
         validation_errors.extend(_run_validation(final_text))
-        rca_output, parse_errors = _parse_json_output(final_text)
-        if rca_output is not None:
-            with open(output_path, "w") as output_file:
-                json.dump(rca_output, output_file, indent=2)
+        data, parse_errors = _parse_json_output(final_text)
+        if data is not None:
+            with open(output_path, "w") as f:
+                json.dump(data, f, indent=2)
             saved = True
         else:
             validation_errors.extend(parse_errors)
     else:
         validation_errors.append("No assistant text found in stream-json log")
 
-    return rca_output, saved, validation_errors, _extract_job_stats(log_path)
-
-
-def _analyze_single_job(
-    job_info,
-    plugin_dir,
-    model,
-    agent_system_prompt,
-    logs_dir,
-    workdir,
-    predecessor_workdir,
-):
-    """Analyze one Prow job, reusing a valid predecessor result when possible."""
-    output_path = Path(workdir) / "jobs" / job_info["output_name"]
-    _, reused = _reuse_predecessor_analysis(output_path, predecessor_workdir, workdir)
-
-    if reused:
-        saved = True
-        validation_errors = []
-        stats = _empty_job_stats()
-    else:
-        # Never carry a predecessor result into a failed fresh analysis.
-        _, saved, validation_errors, stats = _run_fresh_analysis(
-            job_info, plugin_dir, model, agent_system_prompt, logs_dir, output_path
-        )
-
-    return JobAnalysisResult(
-        saved=saved,
-        output_path=str(output_path) if saved else None,
-        validation_errors=validation_errors,
-        stats=stats,
-        reused=reused,
-    )
+    stats = _extract_job_stats(log_path)
+    return saved, str(output_path) if saved else None, validation_errors, stats
 
 
 def main():
