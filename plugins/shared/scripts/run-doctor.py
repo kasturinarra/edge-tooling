@@ -134,15 +134,15 @@ def _fetch_prow_jobs():
     return data if isinstance(data, list) else None
 
 
-def _select_predecessor(jobs, doctor_job, current_build):
+def _select_predecessor(jobs, current_job_name, current_build):
     """Select the latest successful matching doctor job before this build."""
-    if not current_build:
+    if not current_job_name or not current_build:
         return None
     candidates = [
         (str(job.get("started", "")), job.get("url", ""))
         for job in jobs
         if isinstance(job, dict)
-        and doctor_job in job.get("job", "")
+        and job.get("job") == current_job_name
         and job.get("state") == "success"
         and str(job.get("build_id", "")) != str(current_build)
         and job.get("url")
@@ -150,8 +150,31 @@ def _select_predecessor(jobs, doctor_job, current_build):
     return max(candidates, default=None)
 
 
+def _rebase_evidence_path(original_path, current_root):
+    """Return the unique existing current-workdir evidence path, or None."""
+    if not original_path.is_absolute() or ".." in original_path.parts:
+        return None
+    try:
+        resolved_root = Path(current_root).resolve(strict=True)
+    except OSError:
+        return None
+
+    candidates = []
+    for index, part in enumerate(original_path.parts):
+        if part not in EVIDENCE_DIRS:
+            continue
+        try:
+            candidate = (resolved_root / Path(*original_path.parts[index:])).resolve(strict=True)
+        except OSError:
+            continue
+        if candidate.is_relative_to(resolved_root) and candidate.is_file():
+            candidates.append(candidate)
+
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _materialize_predecessor_report(source_root, predecessor_root, current_root, output_name):
-    """Copy one report and its evidence into a temporary predecessor workdir."""
+    """Save one predecessor report with evidence rebased to the current workdir."""
     report_path = source_root / output_name
     try:
         report = json.loads(report_path.read_text())
@@ -162,20 +185,10 @@ def _materialize_predecessor_report(source_root, predecessor_root, current_root,
                 if not match:
                     return False
                 original_path = Path(match.group(1))
-                if not original_path.is_absolute() or ".." in original_path.parts:
+                rebased_path = _rebase_evidence_path(original_path, current_root)
+                if rebased_path is None:
                     return False
-                source_path = next((
-                    current_root.joinpath(*original_path.parts[index:])
-                    for index, part in enumerate(original_path.parts)
-                    if part in EVIDENCE_DIRS
-                    and current_root.joinpath(*original_path.parts[index:]).is_file()
-                ), None)
-                if source_path is None:
-                    return False
-                destination_path = predecessor_root / source_path.relative_to(current_root)
-                destination_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source_path, destination_path)
-                link["evidence"] = f"{destination_path}:{match.group(2)}"
+                link["evidence"] = f"{rebased_path}:{match.group(2)}"
         if _run_validation(json.dumps(report)):
             return False
         destination_report = predecessor_root / "jobs" / output_name
@@ -198,19 +211,20 @@ def _download_predecessor_workdir(prow_url, doctor_job, output_names, current_wo
                      f"openshift-edge-tooling-{doctor_job}/artifacts/")
     try:
         download_root.mkdir()
-        copied = 0
+        materialized_report = False
         for name in output_names:
             result = subprocess.run(
                 ["gsutil", "-q", "cp", f"{gcs_artifacts}jobs/{name}", str(download_root)],
                 capture_output=True, text=True, timeout=60, check=False,
             )
-            if result.returncode == 0:
-                copied += _materialize_predecessor_report(
-                    download_root, Path(temporary_workdir.name),
-                    Path(current_workdir), name,
-                )
+            if result.returncode != 0:
+                continue
+            if _materialize_predecessor_report(
+                download_root, Path(temporary_workdir.name), Path(current_workdir), name,
+            ):
+                materialized_report = True
         shutil.rmtree(download_root)
-        if copied:
+        if materialized_report:
             return temporary_workdir
     except (OSError, subprocess.TimeoutExpired):
         pass
@@ -321,18 +335,22 @@ class DoctorPipeline:
         with open(self.diagnostics_file, "a") as f:
             f.write(msg + "\n")
 
-    def _acquire_predecessor(self):
+    def _acquire_predecessor(self, jobs):
         """Download matching predecessor reports after current artifacts are ready."""
         if self._predecessor_attempted:
             return
         self._predecessor_attempted = True
+        current_job_name = os.environ.get("JOB_NAME")
+        current_build = os.environ.get("BUILD_ID")
+        if not current_job_name or not current_build:
+            return
         doctor_job = DOCTOR_JOB_NAMES.get(self.component)
-        jobs = _fetch_prow_jobs()
-        selected = _select_predecessor(jobs or [], doctor_job, os.environ.get("BUILD_ID"))
+        prow_jobs = _fetch_prow_jobs()
+        selected = _select_predecessor(prow_jobs or [], current_job_name, current_build)
         if not selected:
             return
         _, prow_url = selected
-        output_names = {job["output_name"] for job in self._collect_jobs_to_analyze()}
+        output_names = {job["output_name"] for job in jobs}
         predecessor = _download_predecessor_workdir(
             prow_url, doctor_job, output_names, self.workdir
         )
@@ -600,9 +618,8 @@ class DoctorPipeline:
                 self.message("ERROR: analyze requires prepare-summary.json")
                 return False
 
-        self._acquire_predecessor()
-
         jobs = self._collect_jobs_to_analyze()
+        self._acquire_predecessor(jobs)
         if not jobs:
             log.info("No jobs to analyze")
             return True
