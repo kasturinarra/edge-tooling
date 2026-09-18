@@ -9,18 +9,22 @@ plugins/microshift-ci/scripts/run-doctor.py -> component "microshift").
 """
 
 import argparse
+import gzip
 import json
 import logging
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib import request
 
 log = logging.getLogger("doctor")
 
@@ -69,6 +73,13 @@ DOCTOR_SH_TIMEOUT = {
     "finalize": 300,
 }
 
+PROW_DATA_URL = "https://prow.ci.openshift.org/data.js"
+DOCTOR_JOB_NAMES = {
+    "microshift": "microshift-ci-doctor",
+    "lvm-operator": "lvms-ci-doctor",
+}
+EVIDENCE_DIRS = {"artifacts", "graphs", "logs", "src"}
+
 
 def detect_component():
     """Auto-detect component from the invocation path of sys.argv[0].
@@ -107,6 +118,104 @@ def strip_frontmatter(text):
         if end != -1:
             return text[end + 4:].lstrip("\n")
     return text
+
+
+def _fetch_prow_jobs():
+    """Return Prow's job metadata, or None when discovery is unavailable."""
+    try:
+        req = request.Request(PROW_DATA_URL, headers={"Accept-Encoding": "gzip"})
+        with request.urlopen(req, timeout=30) as response:
+            data = response.read()
+            if response.headers.get("Content-Encoding") == "gzip":
+                data = gzip.decompress(data)
+        data = json.loads(data)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, list) else None
+
+
+def _select_predecessor(jobs, doctor_job, current_build):
+    """Select the latest successful matching doctor job before this build."""
+    if not current_build:
+        return None
+    candidates = [
+        (str(job.get("started", "")), job.get("url", ""))
+        for job in jobs
+        if isinstance(job, dict)
+        and doctor_job in job.get("job", "")
+        and job.get("state") == "success"
+        and str(job.get("build_id", "")) != str(current_build)
+        and job.get("url")
+    ]
+    return max(candidates, default=None)
+
+
+def _materialize_predecessor_report(source_root, predecessor_root, current_root, output_name):
+    """Copy one report and its evidence into a temporary predecessor workdir."""
+    report_path = source_root / output_name
+    try:
+        report = json.loads(report_path.read_text())
+        for entry in report:
+            for link in entry.get("causal_chain", []):
+                evidence = link["evidence"]
+                match = re.fullmatch(r"(.+):(\d+)", evidence)
+                if not match:
+                    return False
+                original_path = Path(match.group(1))
+                if not original_path.is_absolute() or ".." in original_path.parts:
+                    return False
+                source_path = next((
+                    current_root.joinpath(*original_path.parts[index:])
+                    for index, part in enumerate(original_path.parts)
+                    if part in EVIDENCE_DIRS
+                    and current_root.joinpath(*original_path.parts[index:]).is_file()
+                ), None)
+                if source_path is None:
+                    return False
+                destination_path = predecessor_root / source_path.relative_to(current_root)
+                destination_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_path, destination_path)
+                link["evidence"] = f"{destination_path}:{match.group(2)}"
+        if _run_validation(json.dumps(report)):
+            return False
+        destination_report = predecessor_root / "jobs" / output_name
+        destination_report.parent.mkdir(parents=True, exist_ok=True)
+        destination_report.write_text(json.dumps(report, indent=2))
+    except (AttributeError, KeyError, OSError, TypeError, json.JSONDecodeError, ValueError):
+        return False
+    return True
+
+
+def _download_predecessor_workdir(prow_url, doctor_job, output_names, current_workdir):
+    """Download and materialize matching predecessor reports, or return None."""
+    gcs_base = re.sub(r"^https://prow\.ci\.openshift\.org/view/gs/", "gs://", prow_url)
+    gcs_base = re.sub(r"^https://gcsweb-ci\.apps\.ci\.l2s4\.p1\.openshiftapps\.com/gcs/", "gs://", gcs_base)
+    if gcs_base == prow_url:
+        return None
+    temporary_workdir = tempfile.TemporaryDirectory(prefix="doctor-predecessor-")
+    download_root = Path(temporary_workdir.name) / ".download"
+    gcs_artifacts = (f"{gcs_base}/artifacts/{doctor_job}/"
+                     f"openshift-edge-tooling-{doctor_job}/artifacts/")
+    try:
+        download_root.mkdir()
+        copied = 0
+        for name in output_names:
+            result = subprocess.run(
+                ["gsutil", "-q", "cp", f"{gcs_artifacts}jobs/{name}", str(download_root)],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+            if result.returncode == 0:
+                copied += _materialize_predecessor_report(
+                    download_root, Path(temporary_workdir.name),
+                    Path(current_workdir), name,
+                )
+        shutil.rmtree(download_root)
+        if copied:
+            return temporary_workdir
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    temporary_workdir.cleanup()
+    return None
 
 
 def parse_args():
@@ -196,6 +305,8 @@ class DoctorPipeline:
         self.prepare_summary = None
         self.analyze_costs = {}
         self.predecessor_workdir = args.predecessor_workdir
+        self._predecessor_tempdir = None
+        self._predecessor_attempted = bool(self.predecessor_workdir)
 
     @property
     def agent_system_prompt(self):
@@ -209,6 +320,25 @@ class DoctorPipeline:
         log.warning(msg)
         with open(self.diagnostics_file, "a") as f:
             f.write(msg + "\n")
+
+    def _acquire_predecessor(self):
+        """Download matching predecessor reports after current artifacts are ready."""
+        if self._predecessor_attempted:
+            return
+        self._predecessor_attempted = True
+        doctor_job = DOCTOR_JOB_NAMES.get(self.component)
+        jobs = _fetch_prow_jobs()
+        selected = _select_predecessor(jobs or [], doctor_job, os.environ.get("BUILD_ID"))
+        if not selected:
+            return
+        _, prow_url = selected
+        output_names = {job["output_name"] for job in self._collect_jobs_to_analyze()}
+        predecessor = _download_predecessor_workdir(
+            prow_url, doctor_job, output_names, self.workdir
+        )
+        if predecessor:
+            self._predecessor_tempdir = predecessor
+            self.predecessor_workdir = predecessor.name
 
     def run_doctor_sh(self, subcommand, extra_args, log_name):
         """Run a doctor-helper.sh subcommand, streaming output live and to a log file."""
@@ -434,12 +564,16 @@ class DoctorPipeline:
                     with open(summary_path, "w") as f:
                         json.dump(summary, f, indent=2)
                     self.prepare_summary = summary
+                    self._acquire_predecessor()
                     return True
                 except json.JSONDecodeError:
                     pass
 
         if summary_path.exists():
-            return self._load_prepare_summary(summary_path)
+            if self._load_prepare_summary(summary_path):
+                self._acquire_predecessor()
+                return True
+            return False
 
         self.message("ERROR: prepare did not produce a JSON summary")
         return False
@@ -469,6 +603,8 @@ class DoctorPipeline:
             else:
                 self.message("ERROR: analyze requires prepare-summary.json")
                 return False
+
+        self._acquire_predecessor()
 
         jobs = self._collect_jobs_to_analyze()
         if not jobs:
@@ -849,8 +985,7 @@ def _reuse_predecessor_analysis(output_path, predecessor_workdir):
         temporary_output.write_text(json.dumps(data, indent=2))
         temporary_output.replace(output_path)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        log.info("[REUSE MISS] Could not reuse %s: %s; running fresh analysis",
-                 predecessor_output, exc)
+        log.debug("Predecessor reuse unavailable for %s: %s", predecessor_output, exc)
         return False
 
     log.info("[REUSE] Reused predecessor analysis %s", predecessor_output)
