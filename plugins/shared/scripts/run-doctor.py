@@ -564,16 +564,12 @@ class DoctorPipeline:
                     with open(summary_path, "w") as f:
                         json.dump(summary, f, indent=2)
                     self.prepare_summary = summary
-                    self._acquire_predecessor()
                     return True
                 except json.JSONDecodeError:
                     pass
 
         if summary_path.exists():
-            if self._load_prepare_summary(summary_path):
-                self._acquire_predecessor()
-                return True
-            return False
+            return self._load_prepare_summary(summary_path)
 
         self.message("ERROR: prepare did not produce a JSON summary")
         return False
