@@ -15,7 +15,6 @@ import logging
 import os
 import re
 import signal
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -120,34 +119,35 @@ def strip_frontmatter(text):
     return text
 
 
-def _fetch_prow_jobs():
-    """Return Prow's job metadata, or None when discovery is unavailable."""
+def _find_predecessor_url():
+    """Return the latest successful earlier URL for this exact Prow job."""
+    current_job_name = os.environ.get("JOB_NAME")
+    current_build = os.environ.get("BUILD_ID")
+    if not current_job_name or not current_build:
+        return None
     try:
         req = request.Request(PROW_DATA_URL, headers={"Accept-Encoding": "gzip"})
         with request.urlopen(req, timeout=30) as response:
             data = response.read()
             if response.headers.get("Content-Encoding") == "gzip":
                 data = gzip.decompress(data)
-        data = json.loads(data)
+        jobs = json.loads(data)
     except (OSError, ValueError, json.JSONDecodeError):
         return None
-    return data if isinstance(data, list) else None
 
-
-def _select_predecessor(jobs, current_job_name, current_build):
-    """Select the latest successful matching doctor job before this build."""
-    if not current_job_name or not current_build:
+    if not isinstance(jobs, list):
         return None
     candidates = [
-        (str(job.get("started", "")), job.get("url", ""))
+        (str(job.get("started", "")), job["url"])
         for job in jobs
         if isinstance(job, dict)
         and job.get("job") == current_job_name
         and job.get("state") == "success"
         and str(job.get("build_id", "")) != str(current_build)
-        and job.get("url")
+        and isinstance(job.get("url"), str)
+        and job["url"]
     ]
-    return max(candidates, default=None)
+    return max(candidates, default=(None, None))[1]
 
 
 def _rebase_evidence_path(original_path, current_root):
@@ -173,11 +173,11 @@ def _rebase_evidence_path(original_path, current_root):
     return candidates[0] if len(candidates) == 1 else None
 
 
-def _materialize_predecessor_report(source_root, predecessor_root, current_root, output_name):
-    """Save one predecessor report with evidence rebased to the current workdir."""
-    report_path = source_root / output_name
+def _materialize_predecessor_report(downloaded_report, current_output):
+    """Rebase, validate, and atomically save one predecessor report."""
+    temporary_output = None
     try:
-        report = json.loads(report_path.read_text())
+        report = json.loads(downloaded_report.read_text())
         for entry in report:
             for link in entry.get("causal_chain", []):
                 evidence = link["evidence"]
@@ -185,49 +185,32 @@ def _materialize_predecessor_report(source_root, predecessor_root, current_root,
                 if not match:
                     return False
                 original_path = Path(match.group(1))
-                rebased_path = _rebase_evidence_path(original_path, current_root)
+                rebased_path = _rebase_evidence_path(original_path, current_output.parent.parent)
                 if rebased_path is None:
                     return False
                 link["evidence"] = f"{rebased_path}:{match.group(2)}"
-        destination_report = predecessor_root / "jobs" / output_name
-        destination_report.parent.mkdir(parents=True, exist_ok=True)
-        destination_report.write_text(json.dumps(report, indent=2))
+
+        text = json.dumps(report, indent=2)
+        if _run_validation(text):
+            return False
+
+        current_output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", dir=current_output.parent, prefix=f".{current_output.name}.",
+            suffix=".tmp", delete=False,
+        ) as temporary_file:
+            temporary_file.write(text)
+            temporary_output = Path(temporary_file.name)
+        temporary_output.replace(current_output)
     except (AttributeError, KeyError, OSError, TypeError, json.JSONDecodeError, ValueError):
         return False
+    finally:
+        if temporary_output is not None:
+            try:
+                temporary_output.unlink(missing_ok=True)
+            except OSError:
+                pass
     return True
-
-
-def _download_predecessor_workdir(prow_url, doctor_job, output_names, current_workdir):
-    """Download and materialize matching predecessor reports, or return None."""
-    gcs_base = re.sub(r"^https://prow\.ci\.openshift\.org/view/gs/", "gs://", prow_url)
-    gcs_base = re.sub(r"^https://gcsweb-ci\.apps\.ci\.l2s4\.p1\.openshiftapps\.com/gcs/", "gs://", gcs_base)
-    if gcs_base == prow_url:
-        return None
-    temporary_workdir = tempfile.TemporaryDirectory(prefix="doctor-predecessor-")
-    download_root = Path(temporary_workdir.name) / ".download"
-    gcs_artifacts = (f"{gcs_base}/artifacts/{doctor_job}/"
-                     f"openshift-edge-tooling-{doctor_job}/artifacts/")
-    try:
-        download_root.mkdir()
-        materialized_report = False
-        for name in output_names:
-            result = subprocess.run(
-                ["gsutil", "-q", "cp", f"{gcs_artifacts}jobs/{name}", str(download_root)],
-                capture_output=True, text=True, timeout=60, check=False,
-            )
-            if result.returncode != 0:
-                continue
-            if _materialize_predecessor_report(
-                download_root, Path(temporary_workdir.name), Path(current_workdir), name,
-            ):
-                materialized_report = True
-        shutil.rmtree(download_root)
-        if materialized_report:
-            return temporary_workdir
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    temporary_workdir.cleanup()
-    return None
 
 
 def parse_args():
@@ -267,7 +250,7 @@ def parse_args():
     parser.add_argument("--repo",
                         help="GitHub org/repo for source checkout (e.g. openshift/microshift)")
     parser.add_argument("--predecessor-workdir",
-                        help="Path to a predecessor run's workdir for RCA reuse")
+                        help="GCS base or component artifact path for predecessor RCA reuse")
     return parser.parse_args()
 
 
@@ -316,9 +299,8 @@ class DoctorPipeline:
 
         self.prepare_summary = None
         self.analyze_costs = {}
-        self.predecessor_workdir = args.predecessor_workdir
-        self._predecessor_tempdir = None
-        self._predecessor_attempted = bool(self.predecessor_workdir)
+        self.predecessor_gcs_path = args.predecessor_workdir
+        self._predecessor_attempted = False
 
     @property
     def agent_system_prompt(self):
@@ -334,27 +316,70 @@ class DoctorPipeline:
             f.write(msg + "\n")
 
     def _acquire_predecessor(self, jobs):
-        """Download matching predecessor reports after current artifacts are ready."""
+        """Download and materialize reusable predecessor reports after graphs."""
         if self._predecessor_attempted:
             return
         self._predecessor_attempted = True
-        current_job_name = os.environ.get("JOB_NAME")
-        current_build = os.environ.get("BUILD_ID")
-        if not current_job_name or not current_build:
-            return
+
+        output_paths = {
+            self.workdir / "jobs" / job["output_name"]
+            for job in jobs
+        }
+        for output_path in output_paths:
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError as exc:
+                self.message(f"WARNING: Could not clear stale predecessor target {output_path}: {exc}")
+
         doctor_job = DOCTOR_JOB_NAMES.get(self.component)
-        prow_jobs = _fetch_prow_jobs()
-        selected = _select_predecessor(prow_jobs or [], current_job_name, current_build)
-        if not selected:
+        if not doctor_job:
             return
-        _, prow_url = selected
-        output_names = {job["output_name"] for job in jobs}
-        predecessor = _download_predecessor_workdir(
-            prow_url, doctor_job, output_names, self.workdir
+        predecessor_base = self.predecessor_gcs_path or _find_predecessor_url()
+        if not predecessor_base:
+            return
+
+        gcs_base = re.sub(
+            r"^https://prow\.ci\.openshift\.org/view/gs/", "gs://", predecessor_base,
         )
-        if predecessor:
-            self._predecessor_tempdir = predecessor
-            self.predecessor_workdir = predecessor.name
+        gcs_base = re.sub(
+            r"^https://gcsweb-ci\.apps\.ci\.l2s4\.p1\.openshiftapps\.com/gcs/", "gs://", gcs_base,
+        )
+        if not gcs_base.startswith("gs://"):
+            self.message(f"WARNING: Invalid predecessor GCS path: {predecessor_base}")
+            return
+
+        artifact_suffix = (
+            f"artifacts/{doctor_job}/openshift-edge-tooling-{doctor_job}/artifacts"
+        )
+        gcs_base = gcs_base.rstrip("/")
+        gcs_artifacts = (
+            gcs_base if gcs_base.endswith(artifact_suffix)
+            else f"{gcs_base}/{artifact_suffix}"
+        )
+        for output_path in output_paths:
+            downloaded_report = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    prefix="doctor-predecessor-", suffix=".json", delete=False,
+                ) as temporary_file:
+                    downloaded_report = Path(temporary_file.name)
+                result = subprocess.run(
+                    ["gsutil", "-q", "cp", f"{gcs_artifacts}/jobs/{output_path.name}",
+                     str(downloaded_report)],
+                    capture_output=True, text=True, timeout=60, check=False,
+                )
+                if result.returncode != 0:
+                    continue
+                if _materialize_predecessor_report(downloaded_report, output_path):
+                    log.info("[REUSE] Acquired predecessor analysis %s", output_path)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                log.debug("Predecessor acquisition unavailable for %s: %s", output_path, exc)
+            finally:
+                if downloaded_report is not None:
+                    try:
+                        downloaded_report.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
     def run_doctor_sh(self, subcommand, extra_args, log_name):
         """Run a doctor-helper.sh subcommand, streaming output live and to a log file."""
@@ -637,7 +662,6 @@ class DoctorPipeline:
                     agent_system_prompt=self.agent_system_prompt,
                     logs_dir=str(self.logs_dir),
                     workdir=str(self.workdir),
-                    predecessor_workdir=self.predecessor_workdir,
                 )
                 futures[future] = job_info
 
@@ -980,29 +1004,6 @@ def _extract_result_text_standalone(log_path):
     return _load_validate_module()._extract_last_assistant_message_from_transcript(log_path)
 
 
-def _reuse_predecessor_analysis(output_path, predecessor_workdir):
-    """Reuse a valid matching predecessor RCA file, if available."""
-    if not predecessor_workdir:
-        return False
-
-    predecessor_output = Path(predecessor_workdir) / "jobs" / output_path.name
-    try:
-        text = predecessor_output.read_text()
-        data = json.loads(text)
-        errors = _run_validation(text)
-        if errors:
-            raise ValueError("; ".join(errors))
-        temporary_output = output_path.with_suffix(".json.tmp")
-        temporary_output.write_text(json.dumps(data, indent=2))
-        temporary_output.replace(output_path)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        log.debug("Predecessor reuse unavailable for %s: %s", predecessor_output, exc)
-        return False
-
-    log.info("[REUSE] Reused predecessor analysis %s", predecessor_output)
-    return True
-
-
 def _extract_job_stats(log_path):
     """Extract cost, stop hook count, turn count, and permission denials from a stream-json log."""
     cost_usd = 0
@@ -1132,7 +1133,7 @@ def _run_claude_session(prompt, system_prompt, plugin_dir, model, log_path,
 
 
 def _analyze_single_job(job_info, plugin_dir, model, agent_system_prompt,
-                        logs_dir, workdir, predecessor_workdir=None):
+                        logs_dir, workdir):
     """Analyze a single prow job via claude -p. Called in a subprocess."""
     prompt_parts = [
         "Analyze this prow job:",
@@ -1150,9 +1151,9 @@ def _analyze_single_job(job_info, plugin_dir, model, agent_system_prompt,
     log_stem = Path(job_info["log_name"]).stem
     debug_file = str(Path(logs_dir) / f"{log_stem}-debug.log")
     output_path = Path(workdir) / "jobs" / job_info["output_name"]
-    if _reuse_predecessor_analysis(output_path, predecessor_workdir):
+    if output_path.exists():
+        log.info("[REUSE] Reused acquired predecessor analysis %s", output_path)
         return True, str(output_path), [], {"cost_usd": 0, "duration_ms": 0}
-    output_path.unlink(missing_ok=True)
     limits = STAGE_LIMITS["analyze"]
 
     env = os.environ.copy()
