@@ -189,8 +189,6 @@ def _materialize_predecessor_report(source_root, predecessor_root, current_root,
                 if rebased_path is None:
                     return False
                 link["evidence"] = f"{rebased_path}:{match.group(2)}"
-        if _run_validation(json.dumps(report)):
-            return False
         destination_report = predecessor_root / "jobs" / output_name
         destination_report.parent.mkdir(parents=True, exist_ok=True)
         destination_report.write_text(json.dumps(report, indent=2))
