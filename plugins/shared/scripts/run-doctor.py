@@ -619,10 +619,10 @@ class DoctorPipeline:
                 return False
 
         jobs = self._collect_jobs_to_analyze()
-        self._acquire_predecessor(jobs)
         if not jobs:
             log.info("No jobs to analyze")
             return True
+        self._acquire_predecessor(jobs)
 
         log.info("Analyzing %d jobs (max %d parallel)...", len(jobs), self.max_parallel)
 
