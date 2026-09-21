@@ -180,7 +180,7 @@ def rebase_evidence_path(original_path, current_root):
     return candidates[0] if len(candidates) == 1 else None
 
 
-def _atomic_write_text(text, target):
+def atomic_write_text(text, target):
     """Atomically replace *target* with text written beside it."""
     target.parent.mkdir(parents=True, exist_ok=True)
     # Create a temporary file beside target so Path.replace() atomically replaces it
@@ -232,7 +232,7 @@ def materialize_predecessor_report(downloaded_report, current_output):
             )
             return False
 
-        _atomic_write_text(text, current_output)
+        atomic_write_text(text, current_output)
     except (AttributeError, KeyError, OSError, TypeError, json.JSONDecodeError, ValueError) as exc:
         log.debug(
             "Predecessor report materialization failed for %s -> %s: %s",
