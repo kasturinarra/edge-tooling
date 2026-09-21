@@ -124,6 +124,11 @@ def find_predecessor_url():
     current_job_name = os.environ.get("JOB_NAME")
     current_build = os.environ.get("BUILD_ID")
     if not current_job_name or not current_build:
+        missing = [
+            name for name, value in (("JOB_NAME", current_job_name), ("BUILD_ID", current_build))
+            if not value
+        ]
+        log.debug("Predecessor discovery skipped; missing %s", ", ".join(missing))
         return None
     try:
         req = request.Request(PROW_DATA_URL, headers={"Accept-Encoding": "gzip"})
@@ -132,10 +137,12 @@ def find_predecessor_url():
             if response.headers.get("Content-Encoding") == "gzip":
                 data = gzip.decompress(data)
         jobs = json.loads(data)
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        log.debug("Predecessor discovery failed for %s: %s", PROW_DATA_URL, exc)
         return None
 
     if not isinstance(jobs, list):
+        log.debug("Predecessor discovery returned %s instead of a job list", type(jobs).__name__)
         return None
     candidates = [
         (str(job.get("started", "")), job["url"])
@@ -178,20 +185,33 @@ def materialize_predecessor_report(downloaded_report, current_output):
     temporary_output = None
     try:
         report = json.loads(downloaded_report.read_text())
-        for entry in report:
-            for link in entry.get("causal_chain", []):
+        for entry_index, entry in enumerate(report):
+            for link_index, link in enumerate(entry.get("causal_chain", [])):
                 evidence = link["evidence"]
                 match = re.fullmatch(r"(.+):(\d+)", evidence)
                 if not match:
+                    log.debug(
+                        "Predecessor report rejected for %s: entry %d causal link %d has invalid evidence",
+                        downloaded_report, entry_index, link_index,
+                    )
                     return False
                 original_path = Path(match.group(1))
                 rebased_path = rebase_evidence_path(original_path, current_output.parent.parent)
                 if rebased_path is None:
+                    log.debug(
+                        "Predecessor report rejected for %s: entry %d causal link %d could not rebase evidence",
+                        downloaded_report, entry_index, link_index,
+                    )
                     return False
                 link["evidence"] = f"{rebased_path}:{match.group(2)}"
 
         text = json.dumps(report, indent=2)
-        if _run_validation(text):
+        validation_errors = _run_validation(text)
+        if validation_errors:
+            log.debug(
+                "Predecessor report rejected for %s: validation failed (%d errors): %s",
+                downloaded_report, len(validation_errors), validation_errors[0],
+            )
             return False
 
         current_output.parent.mkdir(parents=True, exist_ok=True)
@@ -202,7 +222,13 @@ def materialize_predecessor_report(downloaded_report, current_output):
             temporary_file.write(text)
             temporary_output = Path(temporary_file.name)
         temporary_output.replace(current_output)
-    except (AttributeError, KeyError, OSError, TypeError, json.JSONDecodeError, ValueError):
+        # The successful same-directory replace consumed the temporary pathname.
+        temporary_output = None
+    except (AttributeError, KeyError, OSError, TypeError, json.JSONDecodeError, ValueError) as exc:
+        log.debug(
+            "Predecessor report materialization failed for %s -> %s: %s",
+            downloaded_report, current_output, exc,
+        )
         return False
     finally:
         if temporary_output is not None:
@@ -357,29 +383,27 @@ class DoctorPipeline:
             else f"{gcs_base}/{artifact_suffix}"
         )
         for output_path in output_paths:
-            downloaded_report = None
+            source = f"{gcs_artifacts}/jobs/{output_path.name}"
             try:
-                with tempfile.NamedTemporaryFile(
-                    prefix="doctor-predecessor-", suffix=".json", delete=False,
-                ) as temporary_file:
-                    downloaded_report = Path(temporary_file.name)
-                result = subprocess.run(
-                    ["gsutil", "-q", "cp", f"{gcs_artifacts}/jobs/{output_path.name}",
-                     str(downloaded_report)],
-                    capture_output=True, text=True, timeout=60, check=False,
-                )
-                if result.returncode != 0:
-                    continue
-                if materialize_predecessor_report(downloaded_report, output_path):
-                    log.info("[REUSE] Acquired predecessor analysis %s", output_path)
+                with tempfile.TemporaryDirectory(prefix="doctor-predecessor-") as temporary_dir:
+                    downloaded_report = Path(temporary_dir) / output_path.name
+                    result = subprocess.run(
+                        ["gsutil", "-q", "cp", source, str(downloaded_report)],
+                        capture_output=True, text=True, timeout=60, check=False,
+                    )
+                    if result.returncode != 0:
+                        log.debug(
+                            "Predecessor download failed for %s -> %s: gsutil exited %d: %s",
+                            source, output_path, result.returncode, result.stderr.strip(),
+                        )
+                        continue
+                    if materialize_predecessor_report(downloaded_report, output_path):
+                        log.info("[REUSE] Acquired predecessor analysis %s", output_path)
+                    else:
+                        log.debug("Predecessor report was not reused for %s", output_path)
             except (OSError, subprocess.TimeoutExpired) as exc:
-                log.debug("Predecessor acquisition unavailable for %s: %s", output_path, exc)
-            finally:
-                if downloaded_report is not None:
-                    try:
-                        downloaded_report.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+                log.debug("Predecessor acquisition unavailable for %s -> %s: %s",
+                          source, output_path, exc)
 
     def run_doctor_sh(self, subcommand, extra_args, log_name):
         """Run a doctor-helper.sh subcommand, streaming output live and to a log file."""
