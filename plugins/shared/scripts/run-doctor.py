@@ -77,7 +77,7 @@ DOCTOR_JOB_NAMES = {
     "microshift": "microshift-ci-doctor",
     "lvm-operator": "lvms-ci-doctor",
 }
-EVIDENCE_DIRS = {"artifacts", "graphs", "logs", "src"}
+EVIDENCE_DIRS = {"artifacts"}
 
 
 def detect_component():
