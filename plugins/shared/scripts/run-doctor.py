@@ -119,7 +119,7 @@ def strip_frontmatter(text):
     return text
 
 
-def _find_predecessor_url():
+def find_predecessor_url():
     """Return the latest successful earlier URL for this exact Prow job."""
     current_job_name = os.environ.get("JOB_NAME")
     current_build = os.environ.get("BUILD_ID")
@@ -150,7 +150,7 @@ def _find_predecessor_url():
     return max(candidates, default=(None, None))[1]
 
 
-def _rebase_evidence_path(original_path, current_root):
+def rebase_evidence_path(original_path, current_root):
     """Return the unique existing current-workdir evidence path, or None."""
     if not original_path.is_absolute() or ".." in original_path.parts:
         return None
@@ -173,7 +173,7 @@ def _rebase_evidence_path(original_path, current_root):
     return candidates[0] if len(candidates) == 1 else None
 
 
-def _materialize_predecessor_report(downloaded_report, current_output):
+def materialize_predecessor_report(downloaded_report, current_output):
     """Rebase, validate, and atomically save one predecessor report."""
     temporary_output = None
     try:
@@ -185,7 +185,7 @@ def _materialize_predecessor_report(downloaded_report, current_output):
                 if not match:
                     return False
                 original_path = Path(match.group(1))
-                rebased_path = _rebase_evidence_path(original_path, current_output.parent.parent)
+                rebased_path = rebase_evidence_path(original_path, current_output.parent.parent)
                 if rebased_path is None:
                     return False
                 link["evidence"] = f"{rebased_path}:{match.group(2)}"
@@ -315,7 +315,7 @@ class DoctorPipeline:
         with open(self.diagnostics_file, "a") as f:
             f.write(msg + "\n")
 
-    def _acquire_predecessor(self, jobs):
+    def acquire_predecessor(self, jobs):
         """Download and materialize reusable predecessor reports after graphs."""
         if self._predecessor_attempted:
             return
@@ -334,7 +334,7 @@ class DoctorPipeline:
         doctor_job = DOCTOR_JOB_NAMES.get(self.component)
         if not doctor_job:
             return
-        predecessor_base = self.predecessor_gcs_path or _find_predecessor_url()
+        predecessor_base = self.predecessor_gcs_path or find_predecessor_url()
         if not predecessor_base:
             return
 
@@ -370,7 +370,7 @@ class DoctorPipeline:
                 )
                 if result.returncode != 0:
                     continue
-                if _materialize_predecessor_report(downloaded_report, output_path):
+                if materialize_predecessor_report(downloaded_report, output_path):
                     log.info("[REUSE] Acquired predecessor analysis %s", output_path)
             except (OSError, subprocess.TimeoutExpired) as exc:
                 log.debug("Predecessor acquisition unavailable for %s: %s", output_path, exc)
@@ -645,7 +645,7 @@ class DoctorPipeline:
         if not jobs:
             log.info("No jobs to analyze")
             return True
-        self._acquire_predecessor(jobs)
+        self.acquire_predecessor(jobs)
 
         log.info("Analyzing %d jobs (max %d parallel)...", len(jobs), self.max_parallel)
 
