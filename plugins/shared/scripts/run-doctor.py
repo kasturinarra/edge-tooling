@@ -180,9 +180,30 @@ def rebase_evidence_path(original_path, current_root):
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _atomic_write_text(text, target):
+    """Atomically replace *target* with text written beside it."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_name = None
+    try:
+        # Create and close a temporary file beside target so Path.replace() atomically
+        # replaces it on the same filesystem.
+        with tempfile.NamedTemporaryFile(
+            "w", dir=target.parent, prefix=f".{target.name}.", suffix=".tmp", delete=False,
+        ) as temporary_file:
+            temp_name = temporary_file.name
+            temporary_file.write(text)
+        Path(temp_name).replace(target)
+    except BaseException:
+        if temp_name is not None:
+            try:
+                Path(temp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
 def materialize_predecessor_report(downloaded_report, current_output):
     """Rebase, validate, and atomically save one predecessor report."""
-    temporary_output = None
     try:
         report = json.loads(downloaded_report.read_text())
         for entry_index, entry in enumerate(report):
@@ -214,30 +235,13 @@ def materialize_predecessor_report(downloaded_report, current_output):
             )
             return False
 
-        current_output.parent.mkdir(parents=True, exist_ok=True)
-        # Create and close a temporary file beside current_output so Path.replace() atomically
-        # replaces it on the same filesystem.
-        with tempfile.NamedTemporaryFile(
-            "w", dir=current_output.parent, prefix=f".{current_output.name}.",
-            suffix=".tmp", delete=False,
-        ) as temporary_file:
-            temporary_file.write(text)
-            temporary_output = Path(temporary_file.name)
-        temporary_output.replace(current_output)
-        # The successful same-directory replace consumed the temporary pathname.
-        temporary_output = None
+        _atomic_write_text(text, current_output)
     except (AttributeError, KeyError, OSError, TypeError, json.JSONDecodeError, ValueError) as exc:
         log.debug(
             "Predecessor report materialization failed for %s -> %s: %s",
             downloaded_report, current_output, exc,
         )
         return False
-    finally:
-        if temporary_output is not None:
-            try:
-                temporary_output.unlink(missing_ok=True)
-            except OSError:
-                pass
     return True
 
 
