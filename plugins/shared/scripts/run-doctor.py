@@ -183,23 +183,20 @@ def rebase_evidence_path(original_path, current_root):
 def _atomic_write_text(text, target):
     """Atomically replace *target* with text written beside it."""
     target.parent.mkdir(parents=True, exist_ok=True)
-    temp_name = None
-    try:
-        # Create and close a temporary file beside target so Path.replace() atomically
-        # replaces it on the same filesystem.
-        with tempfile.NamedTemporaryFile(
-            "w", dir=target.parent, prefix=f".{target.name}.", suffix=".tmp", delete=False,
-        ) as temporary_file:
-            temp_name = temporary_file.name
-            temporary_file.write(text)
-        Path(temp_name).replace(target)
-    except BaseException:
-        if temp_name is not None:
-            try:
-                Path(temp_name).unlink(missing_ok=True)
-            except OSError:
-                pass
-        raise
+    # Create a temporary file beside target so Path.replace() atomically replaces it
+    # on the same filesystem.
+    with tempfile.NamedTemporaryFile(
+        "w", dir=target.parent, prefix=f".{target.name}.", suffix=".tmp", delete=False,
+    ) as fd:
+        try:
+            fd.write(text)
+            fd.close()
+            Path(fd.name).replace(target)
+        except BaseException:
+            if not fd.closed:
+                fd.close()
+            Path(fd.name).unlink(missing_ok=True)
+            raise
 
 
 def materialize_predecessor_report(downloaded_report, current_output):
