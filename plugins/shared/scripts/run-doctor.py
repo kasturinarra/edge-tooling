@@ -215,6 +215,8 @@ def materialize_predecessor_report(downloaded_report, current_output):
             return False
 
         current_output.parent.mkdir(parents=True, exist_ok=True)
+        # Create and close a temporary file beside current_output so Path.replace() atomically
+        # replaces it on the same filesystem.
         with tempfile.NamedTemporaryFile(
             "w", dir=current_output.parent, prefix=f".{current_output.name}.",
             suffix=".tmp", delete=False,
@@ -351,6 +353,8 @@ class DoctorPipeline:
             self.workdir / "jobs" / job["output_name"]
             for job in jobs
         }
+        # These current-workdir/jobs targets are not downloaded predecessor files; clear stale
+        # outputs so failed acquisition is not mistaken for successful reuse.
         for output_path in output_paths:
             try:
                 output_path.unlink(missing_ok=True)
