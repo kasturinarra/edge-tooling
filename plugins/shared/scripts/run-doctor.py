@@ -265,8 +265,11 @@ def parse_args():
                         help="Include pull request analysis")
     parser.add_argument("--repo",
                         help="GitHub org/repo for source checkout (e.g. openshift/microshift)")
-    parser.add_argument("--predecessor-workdir",
-                        help="GCS base or component artifact path for predecessor RCA reuse")
+    predecessor_group = parser.add_mutually_exclusive_group()
+    predecessor_group.add_argument("--predecessor-workdir",
+                                   help="GCS base or component artifact path for predecessor RCA reuse")
+    predecessor_group.add_argument("--no-predecessor-reuse", action="store_true",
+                                   help="Force fresh RCA analysis without predecessor reuse")
     return parser.parse_args()
 
 
@@ -316,6 +319,7 @@ class DoctorPipeline:
         self.prepare_summary = None
         self.analyze_costs = {}
         self.predecessor_gcs_path = args.predecessor_workdir
+        self.no_predecessor_reuse = args.no_predecessor_reuse
         self._predecessor_attempted = False
 
     @property
@@ -348,6 +352,10 @@ class DoctorPipeline:
                 output_path.unlink(missing_ok=True)
             except OSError as exc:
                 self.message(f"WARNING: Could not clear stale predecessor target {output_path}: {exc}")
+
+        if self.no_predecessor_reuse:
+            log.info("Predecessor reuse disabled")
+            return
 
         doctor_job = DOCTOR_JOB_NAMES.get(self.component)
         if not doctor_job:
