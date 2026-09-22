@@ -355,6 +355,7 @@ class DoctorPipeline:
         predecessor_base = self.predecessor_gcs_path or _find_predecessor_url()
         if not predecessor_base:
             return
+        log.info("Using predecessor: %s", predecessor_base)
 
         gcs_base = re.sub(
             r"^https://prow\.ci\.openshift\.org/view/gs/", "gs://", predecessor_base,
