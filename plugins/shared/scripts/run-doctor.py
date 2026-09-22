@@ -665,7 +665,7 @@ class DoctorPipeline:
 
         log.info("Analyzing %d jobs (max %d parallel)...", len(jobs), self.max_parallel)
 
-        load_validate_module()
+        _load_validate_module()
         results = {}
         with ThreadPoolExecutor(max_workers=self.max_parallel) as pool:
             futures = {}
@@ -995,7 +995,7 @@ class DoctorPipeline:
 _validate_module = None
 
 
-def load_validate_module():
+def _load_validate_module():
     """Import validate-rca-output.py via importlib (filename contains dashes)."""
     global _validate_module
     if _validate_module is None:
@@ -1009,15 +1009,15 @@ def load_validate_module():
 
 
 def _run_validation(text):
-    return load_validate_module().validate_message(text)
+    return _load_validate_module().validate_message(text)
 
 
 def _parse_json_output(text):
-    return load_validate_module().parse_json_output(text)
+    return _load_validate_module().parse_json_output(text)
 
 
 def _extract_result_text_standalone(log_path):
-    return load_validate_module()._extract_last_assistant_message_from_transcript(log_path)
+    return _load_validate_module()._extract_last_assistant_message_from_transcript(log_path)
 
 
 def _extract_job_stats(log_path):
