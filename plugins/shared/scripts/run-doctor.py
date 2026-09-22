@@ -181,26 +181,13 @@ def rebase_evidence_path(original_path, current_root):
 
 
 def atomic_write_text(text, target):
-    """Atomically replace *target* with text written beside it."""
+    """Write text to *target*, creating its parent directory."""
     target.parent.mkdir(parents=True, exist_ok=True)
-    # Create a temporary file beside target so Path.replace() atomically replaces it
-    # on the same filesystem.
-    with tempfile.NamedTemporaryFile(
-        "w", dir=target.parent, prefix=f".{target.name}.", suffix=".tmp", delete=False,
-    ) as fd:
-        try:
-            fd.write(text)
-            fd.close()
-            Path(fd.name).replace(target)
-        except BaseException:
-            if not fd.closed:
-                fd.close()
-            Path(fd.name).unlink(missing_ok=True)
-            raise
+    target.write_text(text)
 
 
 def materialize_predecessor_report(downloaded_report, current_output):
-    """Rebase, validate, and atomically save one predecessor report."""
+    """Rebase, validate, and save one predecessor report."""
     try:
         report = json.loads(downloaded_report.read_text())
         for entry_index, entry in enumerate(report):
