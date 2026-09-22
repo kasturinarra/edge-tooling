@@ -9,6 +9,7 @@ plugins/microshift-ci/scripts/run-doctor.py -> component "microshift").
 """
 
 import argparse
+import gzip
 import json
 import logging
 import os
@@ -16,11 +17,13 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib import request
 
 log = logging.getLogger("doctor")
 
@@ -69,6 +72,13 @@ DOCTOR_SH_TIMEOUT = {
     "finalize": 300,
 }
 
+PROW_DATA_URL = "https://prow.ci.openshift.org/data.js"
+DOCTOR_JOB_NAMES = {
+    "microshift": "microshift-ci-doctor",
+    "lvm-operator": "lvms-ci-doctor",
+}
+EVIDENCE_DIRS = {"artifacts"}
+
 
 def detect_component():
     """Auto-detect component from the invocation path of sys.argv[0].
@@ -109,6 +119,116 @@ def strip_frontmatter(text):
     return text
 
 
+def _find_predecessor_url():
+    """Return the latest successful earlier URL for this exact Prow job."""
+    current_job_name = os.environ.get("JOB_NAME")
+    current_build = os.environ.get("BUILD_ID")
+    if not current_job_name or not current_build:
+        missing = [
+            name for name, value in (("JOB_NAME", current_job_name), ("BUILD_ID", current_build))
+            if not value
+        ]
+        log.debug("Predecessor discovery skipped; missing %s", ", ".join(missing))
+        return None
+    try:
+        req = request.Request(PROW_DATA_URL, headers={"Accept-Encoding": "gzip"})
+        with request.urlopen(req, timeout=30) as response:
+            data = response.read()
+            if response.headers.get("Content-Encoding") == "gzip":
+                data = gzip.decompress(data)
+        jobs = json.loads(data)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        log.debug("Predecessor discovery failed for %s: %s", PROW_DATA_URL, exc)
+        return None
+
+    if not isinstance(jobs, list):
+        log.debug("Predecessor discovery returned %s instead of a job list", type(jobs).__name__)
+        return None
+    candidates = [
+        (str(job.get("started", "")), job["url"])
+        for job in jobs
+        if isinstance(job, dict)
+        and job.get("job") == current_job_name
+        and job.get("state") == "success"
+        and str(job.get("build_id", "")) != str(current_build)
+        and isinstance(job.get("url"), str)
+        and job["url"]
+    ]
+    return max(candidates, default=(None, None))[1]
+
+
+def _rebase_evidence_path(original_path, current_root):
+    """Return the unique existing current-workdir evidence path, or None."""
+    if not original_path.is_absolute() or ".." in original_path.parts:
+        return None
+    try:
+        resolved_root = Path(current_root).resolve(strict=True)
+    except OSError:
+        return None
+
+    candidates = []
+    for index, part in enumerate(original_path.parts):
+        if part not in EVIDENCE_DIRS:
+            continue
+        try:
+            candidate = (resolved_root / Path(*original_path.parts[index:])).resolve(strict=True)
+        except OSError:
+            continue
+        if candidate.is_relative_to(resolved_root) and candidate.is_file():
+            candidates.append(candidate)
+
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _atomic_write_text(text, target):
+    """Write text to *target*, creating its parent directory."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text)
+
+
+def _materialize_predecessor_report(downloaded_report, current_output):
+    """Rebase, validate, and save one predecessor report."""
+    try:
+        report = json.loads(downloaded_report.read_text())
+        for entry_index, entry in enumerate(report):
+            for link_index, link in enumerate(entry.get("causal_chain", [])):
+                evidence = link["evidence"]
+                match = re.fullmatch(r"(.+):(\d+)", evidence)
+                if not match:
+                    log.debug(
+                        "Predecessor report rejected for %s: entry %d causal link %d has invalid evidence",
+                        downloaded_report, entry_index, link_index,
+                    )
+                    return False
+                original_path = Path(match.group(1))
+                rebased_path = _rebase_evidence_path(original_path, current_output.parent.parent)
+                if rebased_path is None:
+                    log.debug(
+                        "Predecessor report rejected for %s: entry %d causal link %d could not rebase evidence",
+                        downloaded_report, entry_index, link_index,
+                    )
+                    return False
+                link["evidence"] = f"{rebased_path}:{match.group(2)}"
+
+        text = json.dumps(report, indent=2)
+        validation_errors = _run_validation(text)
+        if validation_errors:
+            log.debug(
+                "Predecessor report rejected for %s: validation failed (%d errors): %s",
+                downloaded_report, len(validation_errors), validation_errors[0],
+            )
+            return False
+
+        _atomic_write_text(text, current_output)
+    except (AttributeError, KeyError, OSError, TypeError, json.JSONDecodeError, ValueError) as exc:
+        log.debug(
+            "Predecessor report materialization failed for %s -> %s: %s",
+            downloaded_report, current_output, exc,
+        )
+        return False
+    return True
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Deterministic CI doctor pipeline",
@@ -145,6 +265,11 @@ def parse_args():
                         help="Include pull request analysis")
     parser.add_argument("--repo",
                         help="GitHub org/repo for source checkout (e.g. openshift/microshift)")
+    predecessor_group = parser.add_mutually_exclusive_group()
+    predecessor_group.add_argument("--predecessor-workdir",
+                                   help="GCS base or component artifact path for predecessor RCA reuse")
+    predecessor_group.add_argument("--no-predecessor-reuse", action="store_true",
+                                   help="Force fresh RCA analysis without predecessor reuse")
     return parser.parse_args()
 
 
@@ -193,6 +318,9 @@ class DoctorPipeline:
 
         self.prepare_summary = None
         self.analyze_costs = {}
+        self.predecessor_gcs_path = args.predecessor_workdir
+        self.no_predecessor_reuse = args.no_predecessor_reuse
+        self._predecessor_attempted = False
 
     @property
     def agent_system_prompt(self):
@@ -206,6 +334,77 @@ class DoctorPipeline:
         log.warning(msg)
         with open(self.diagnostics_file, "a") as f:
             f.write(msg + "\n")
+
+    def _acquire_predecessor(self, jobs):
+        """Download and materialize reusable predecessor reports after graphs."""
+        if self._predecessor_attempted:
+            return
+        self._predecessor_attempted = True
+
+        output_paths = {
+            self.workdir / "jobs" / job["output_name"]
+            for job in jobs
+        }
+        # These current-workdir/jobs targets are not downloaded predecessor files; clear stale
+        # outputs so failed acquisition is not mistaken for successful reuse.
+        for output_path in output_paths:
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError as exc:
+                self.message(f"WARNING: Could not clear stale predecessor target {output_path}: {exc}")
+
+        if self.no_predecessor_reuse:
+            log.info("Predecessor reuse disabled")
+            return
+
+        doctor_job = DOCTOR_JOB_NAMES.get(self.component)
+        if not doctor_job:
+            return
+        predecessor_base = self.predecessor_gcs_path or _find_predecessor_url()
+        if not predecessor_base:
+            return
+        log.info("Using predecessor: %s", predecessor_base)
+
+        gcs_base = re.sub(
+            r"^https://prow\.ci\.openshift\.org/view/gs/", "gs://", predecessor_base,
+        )
+        gcs_base = re.sub(
+            r"^https://gcsweb-ci\.apps\.ci\.l2s4\.p1\.openshiftapps\.com/gcs/", "gs://", gcs_base,
+        )
+        if not gcs_base.startswith("gs://"):
+            self.message(f"WARNING: Invalid predecessor GCS path: {predecessor_base}")
+            return
+
+        artifact_suffix = (
+            f"artifacts/{doctor_job}/openshift-edge-tooling-{doctor_job}/artifacts"
+        )
+        gcs_base = gcs_base.rstrip("/")
+        gcs_artifacts = (
+            gcs_base if gcs_base.endswith(artifact_suffix)
+            else f"{gcs_base}/{artifact_suffix}"
+        )
+        for output_path in output_paths:
+            source = f"{gcs_artifacts}/jobs/{output_path.name}"
+            try:
+                with tempfile.TemporaryDirectory(prefix="doctor-predecessor-") as temporary_dir:
+                    downloaded_report = Path(temporary_dir) / output_path.name
+                    result = subprocess.run(
+                        ["gsutil", "-q", "cp", source, str(downloaded_report)],
+                        capture_output=True, text=True, timeout=60, check=False,
+                    )
+                    if result.returncode != 0:
+                        log.debug(
+                            "Predecessor download failed for %s -> %s: gsutil exited %d: %s",
+                            source, output_path, result.returncode, result.stderr.strip(),
+                        )
+                        continue
+                    if _materialize_predecessor_report(downloaded_report, output_path):
+                        log.info("[REUSE] Acquired predecessor analysis %s", output_path)
+                    else:
+                        log.debug("Predecessor report was not reused for %s", output_path)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                log.debug("Predecessor acquisition unavailable for %s -> %s: %s",
+                          source, output_path, exc)
 
     def run_doctor_sh(self, subcommand, extra_args, log_name):
         """Run a doctor-helper.sh subcommand, streaming output live and to a log file."""
@@ -471,9 +670,11 @@ class DoctorPipeline:
         if not jobs:
             log.info("No jobs to analyze")
             return True
+        self._acquire_predecessor(jobs)
 
         log.info("Analyzing %d jobs (max %d parallel)...", len(jobs), self.max_parallel)
 
+        _load_validate_module()
         results = {}
         with ThreadPoolExecutor(max_workers=self.max_parallel) as pool:
             futures = {}
@@ -975,6 +1176,9 @@ def _analyze_single_job(job_info, plugin_dir, model, agent_system_prompt,
     log_stem = Path(job_info["log_name"]).stem
     debug_file = str(Path(logs_dir) / f"{log_stem}-debug.log")
     output_path = Path(workdir) / "jobs" / job_info["output_name"]
+    if output_path.exists():
+        log.info("[REUSE] Reused acquired predecessor analysis %s", output_path)
+        return True, str(output_path), [], {"cost_usd": 0, "duration_ms": 0}
     limits = STAGE_LIMITS["analyze"]
 
     env = os.environ.copy()
